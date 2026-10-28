@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""core/config.py — 配置单一来源（L1 分层：领域层）
+
+把配置相关的**常量、默认值、读写、交互向导**从 ``main.py`` 收敛到此处。
+本模块只依赖标准库，不 import ``main`` / ``import_audio`` / tkinter，因此
+可被 CLI、GUI、tab、单测任意引用，无环依赖。
+
+路径锚点说明（沿用 2026-09-18 既定设计）：
+  所有可变文件（config.json）**一律写 APP_DIR**，不写代码目录。
+  - 源码模式： APP_DIR = code 包的父目录（即工具包根）
+  - frozen 模式（exe）：APP_DIR = exe 所在目录
+  老用户历史配置在 ``code/config.json``，由 :func:`config_path` 首次运行自动迁移。
+
+模块内不再重复定义 ``_app_dir()``：由 :func:`set_app_dir` 在 ``main`` 导入时注入，
+避免本模块去猜 frozen 状态（保持单一真相源在 ``main`` 的 ``APP_DIR``）。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional
+
+# ──────────────────── 常量（整轨 / 规格）────────────────────
+# 原定义于 main.py（整轨功能区块）。放进 config 是因为 DEFAULT_CONFIG 依赖它们，
+# 而 config 不应反向 import main。
+
+# 整轨命名默认模板
+DEFAULT_TRACK_TEMPLATE = "{项目名}_{轨道名}"
+
+# 规格预设键（完整 SPEC_PRESETS 表仍在 main.py，此处只放默认键）
+DEFAULT_SPEC_KEY = "keep"
+
+# 片段命名默认模板（兼容旧配置 / CLI 回退）
+DEFAULT_CLIPS_TEMPLATE = "{项目名}_{素材类型}_{序号:03d}_{原始名}_{时长}s"
+
+# 命名模板预设库（「多选命名模板」的候选，用户可在界面增删）。
+# v2.7.0（J1）：条目升级为 {"name": 模板名, "template": 模板串}——模板可命名；
+# 旧版字符串条目在加载时自动迁移（名字=模板串前 12 字符）。
+NAMING_PRESETS = [
+    {"name": "标准 EP 模板", "template": "{项目名} EP{集数} {轨道类别} {序号:02d}"},
+    {"name": "完整信息", "template": "{项目名}_{素材类型}_{序号:03d}_{原始名}_{时长}s"},
+    {"name": "仅原始名", "template": "{原始名}"},
+    {"name": "类型_序号_原名", "template": "{素材类型}_{序号:03d}_{原始名}"},
+    {"name": "项目_序号_原名", "template": "{项目名}_{序号:03d}_{原始名}"},
+    {"name": "项目_类型_序号_原名", "template": "{项目名}_{素材类型}_{序号:03d}_{原始名}"},
+]
+
+
+# ──────────────────── 路径锚点（由 main 注入）────────────────────
+
+# APP_DIR：可变文件落点（源码模式=包根，frozen=exe 旁）
+APP_DIR: Path = Path(__file__).resolve().parent.parent.parent
+# code 源码目录
+SCRIPT_DIR: Path = Path(__file__).resolve().parent.parent
+
+
+def set_app_dir(app_dir: Path) -> None:
+    """由 ``main`` 在导入时注入真实 APP_DIR，并在注入后重算 CONFIG_PATH。
+
+    这样 frozen 判定逻辑只保留在 ``main._app_dir()`` 一处（单一真相源）。
+    """
+    global APP_DIR, CONFIG_PATH, LEGACY_CONFIG_PATH
+    APP_DIR = Path(app_dir)
+    CONFIG_PATH = APP_DIR / "config.json"
+    LEGACY_CONFIG_PATH = SCRIPT_DIR / "config.json"
+
+
+# 模块可被直接 import（不注入）时，退化为「包根」；main 会立刻用 set_app_dir 纠正。
+CONFIG_PATH: Path = APP_DIR / "config.json"
+LEGACY_CONFIG_PATH: Path = SCRIPT_DIR / "config.json"
+
+
+# ──────────────────── 默认配置模板 ────────────────────
+# 出厂默认路径（2026-09-24 定稿，权威清单见知识库
+# 4-项目/12-pt-audio-toolkit仓库维护/06-2026-09-24-四工具默认路径总表.md；
+# 2026-09-28 裁决 10-9：落到 %USERPROFILE% 下，跨机通用）：
+# 统一收口到「用户主目录 /My-Temporary/Backup-Jianying/」下的 Tools / Project 两个分区。
+
+_HOME = Path.home()
+_HOME_BACKUP_JY = _HOME / "My-Temporary" / "Backup-Jianying"
+
+DEFAULT_CONFIG = {
+    "input_dir": str(_HOME_BACKUP_JY / "Project" / "JianyingPro Drafts"),
+    "output_dir": str(_HOME_BACKUP_JY / "Tools" / "out"),
+    "name_template": "{项目名}_{素材类型}_{序号:03d}_{原始名}_{时长}s",
+    # ── 命名模板多选（2026-09-22 新增）──
+    "name_templates": NAMING_PRESETS,                 # 命名模板库（候选清单，可增删）
+    "name_templates_active": [NAMING_PRESETS[0]["template"]],  # 当前勾选（存模板串）
+    "audio_format": "wav",
+    "bitrate_kbps": 320,
+    "conflict": "rename",
+    "dedupe": True,
+    "extract_video_tracks": True,
+    # v2.10.0：断点续跑默认改为**不勾选**（旧默认 True 会把上轮产物当成
+    # 「已完成」整批跳过，用户对着空输出目录以为工具坏了；要续跑再手动勾）
+    "skip_existing": False,
+    # v2.10.0（Q1）：片段命名 {素材类型} 的手动覆盖值 —— 空 = 自动按源判定
+    # （audio/voice/music/sfx）；填 FX/MX/DX/AMB/BG/DIA/MUS 等则全部片段
+    # 用该值命名（UCS 分类码，供音效库归档工作流）
+    "clip_type_override": "",
+    "temp_dir": str(_HOME_BACKUP_JY / "Tools" / "tmp"),
+    # ── 整轨 / AAF（2026-09-18 新增）──
+    "export_mode": "tracks",                     # tracks=整轨（默认）| clips=片段
+    "track_name_template": DEFAULT_TRACK_TEMPLATE,
+    "track_spec": DEFAULT_SPEC_KEY,
+    "export_aaf": False,
+    "aaf_media_mode": "media",                   # media=AAF+Media 文件夹 | embed=单文件内嵌
+    # ── v2.7.0（J10a/J10b）──
+    "split_folder_template": "{视频名}",          # 分包文件夹命名模板（{视频项目}{集数}{编号}{AiFX}{视频名}）
+    "export_subtitles": False,                   # 导出字幕（.srt，文本轨）
+    # ── 日志 / 运行数据目录（v2.6.0：与产物分离，可配置）──
+    # 留空 = 回落输出目录根（兼容旧习惯）
+    "log_dir": str(_HOME_BACKUP_JY / "Tools" / "log"),   # 导出日志落点
+    "data_dir": str(_HOME_BACKUP_JY / "Tools" / "data"), # processed/临时文件等运行数据
+    # ── 按视频分包（v2.5.0）──
+    "split_by_video": False,                     # true=视频轨每个片段一个文件夹
+    "video_project_answers": {},                 # {视频素材名: 人类补的项目名}，记住后不再问
+    # ── 导入页配置（与导出页完全独立，见 tabs/import_tab.py）──
+    "import_json": "",
+    "import_draft_dir": "",    # 钉死单个目标草稿；默认空 = 每次在下拉里选（下拉列表走 input_dir 草稿库）
+    # 交付包落点：独立于产出区，走 Backup-Deliver\Jianying（2026-09-27 裁决 2/6）
+    "import_pkg_out": str(_HOME / "My-Temporary" / "Backup-Deliver" / "Jianying"),
+    "import_exclude": "",
+    "import_keep_aux": False,
+}
+
+# 导入页默认配置（与 DEFAULT_CONFIG 分离，避免两页互相覆写）
+DEFAULT_IMPORT_CONFIG = {
+    "import_json": "",
+    "import_draft_dir": "",
+    "import_pkg_out": "",
+    "import_exclude": "",
+    "import_keep_aux": False,
+}
+
+# 配置字段说明（用于向导提示与诊断）
+CONFIG_FIELDS = {
+    "input_dir": ("剪映草稿目录", "出厂默认 = Backup-Jianying 草稿库；清空 = 自动定位剪映默认草稿目录"),
+    "output_dir": ("音频输出目录（必填）", ""),
+    "name_template": ("命名模板（主模板/兼容字段）", "{项目名}/{素材类型}/{序号:03d}/{原始名}/{日期}/{时长}/{备注}，示例 `{项目名}_{素材类型}_{序号:03d}_{原始名}_{时长}s`"),
+    "name_templates": ("命名模板库（多选）", "片段导出可用的命名模板清单，界面可增删"),
+    "name_templates_active": ("当前勾选的命名模板", "多选；勾选的每套模板都会各生成一份输出（多模板时按 模板N 分目录）"),
+    "audio_format": ("音频格式", "mp3 或 wav"),
+    "bitrate_kbps": ("比特率 kbps（仅 mp3）", "如 128 / 192 / 320"),
+    "conflict": ("重名冲突策略", "rename=自动重命名 | cover=覆盖 | skip=跳过"),
+    "dedupe": ("内容去重", "true=启用（基于首 4KB 哈希）| false=关闭"),
+    "extract_video_tracks": ("提取视频内嵌音轨", "true=启用（方案扩展场景）| false=仅独立音频轨道"),
+    "skip_existing": ("断点续跑", "true=跳过已处理草稿 | false=每次全量（v2.10.0 起默认 false）"),
+    "clip_type_override": ("素材类型覆盖（片段模式）", "空=按素材名自动归类（DX/FX/BG/MX 四桶，v3.10.0）；或自由填写统一命名缩写"),
+    "temp_dir": ("临时目录", "出厂默认 = Tools/tmp；留空 = 数据目录/tmp（数据目录也空则 输出目录/.tmp）"),
+    "log_dir": ("导出日志目录", "导出日志.log 的落点；留空 = 输出目录根"),
+    "data_dir": ("运行数据目录", "processed_drafts.txt（断点续跑）/tmp 临时文件落点；留空 = 输出目录根"),
+}
+
+
+# ──────────────────── 读写 ────────────────────
+
+def setup_logging() -> Optional[logging.Logger]:
+    """初始化工具级滚动日志到配置目录 ``jianying-toolkit.log``（W2 骨架）。
+
+    与「导出日志」分开：导出日志记每次任务明细，工具日志记生命周期/异常，
+    供 D2 的「导出诊断包」一键打包。失败静默返回 None（日志不影响主流程）。
+    """
+    try:
+        root = CONFIG_PATH.parent
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "jianying-toolkit.log"
+        logger = logging.getLogger("jianying-toolkit")
+        if not logger.handlers:
+            handler = RotatingFileHandler(str(path), maxBytes=1_000_000,
+                                          backupCount=3, encoding="utf-8")
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s"))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
+    except Exception:
+        return None
+
+
+def config_path() -> Path:
+    """返回配置文件路径，并在首次运行时把历史 code/config.json 迁移过来。"""
+    if not CONFIG_PATH.exists() and LEGACY_CONFIG_PATH.is_file():
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(LEGACY_CONFIG_PATH, CONFIG_PATH)
+        except Exception:
+            pass
+    return CONFIG_PATH
+
+
+# ──────────────────── 机器键拆分（v3.13.0 C2 · 裁决 13-1）────────────────────
+# exe 目录在 Syncthing 同步盘内：config.json 携 A 机 C:\Users\<A>\... 路径到
+# B 机就是「发现 0 个草稿」的根因。故把**本机磁盘路径键**拆到 exe 旁
+# config.local.json（两机 .stignore 各加一行 `config.local.json` 排除同步，
+# 各机各留各的）；模板/格式/开关等通用键留在 config.json 继续同步。
+
+MACHINE_KEYS = (
+    "input_dir", "output_dir", "temp_dir", "log_dir", "data_dir",
+    "import_json", "import_draft_dir", "import_pkg_out",
+)
+
+
+def local_config_path(config_path: Path) -> Path:
+    """config.json 旁的机器键文件路径（config.local.json）。"""
+    return Path(config_path).parent / "config.local.json"
+
+
+def _read_local(local_path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(local_path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _split_machine_config(cfg: dict, config_path: Path) -> dict:
+    """把主配置里的机器键分流到 config.local.json（两态，同 pt-tools 实现）：
+
+    态① local 文件不存在（首次升级）：主文件机器键迁入新建 local（本机已有
+        配置无损拆分），主文件就地洗净——同步盘里的 config.json 从此干净；
+    态② local 已存在：主文件里再出现机器键 = 他机 config.json 同步带来的
+        **污染**，忽略之（绝不覆盖本机 local 的值），只洗净主文件——
+        两机合流不互踩。
+    返回机器键值 dict（调用方叠加进生效配置）。"""
+    local_path = local_config_path(config_path)
+    machine = {k: cfg.pop(k) for k in MACHINE_KEYS if k in cfg}
+    local = _read_local(local_path)
+    try:
+        if local is None:
+            if machine:
+                local_path.write_text(
+                    json.dumps(machine, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+                config_path.write_text(
+                    json.dumps(cfg, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+            return dict(machine)
+        if machine:
+            config_path.write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+    except OSError:
+        pass
+    return local
+
+
+def load_config(config_path: Path) -> dict:
+    """从磁盘读配置；文件不存在或 JSON 损坏时返回空 dict（调用方补默认值）。
+
+    v2.6.6（J4）：一次性默认值迁移 —— 旧出厂默认「mp3 / 192」在用户没特意
+    改过时升为「wav / 320」（用户反馈的期望默认）。用 ``_migrated_266``
+    标记保证只跑一次：迁移之后用户再特意改回 mp3/192 不会被反复覆盖。
+    v3.13.0 C2：读取后先做机器键分流（local 优先叠加），再走原有迁移标记。
+    """
+    if config_path.exists():
+        raw = config_path.read_text(encoding="utf-8-sig")  # utf-8-sig 自动剥离 BOM
+        try:
+            cfg = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(cfg, dict):
+            local = _split_machine_config(cfg, config_path)   # cfg 就地洗净
+            cfg.update(local)
+        if isinstance(cfg, dict) and not cfg.get("_migrated_266"):
+            changed = False
+            if cfg.get("audio_format", "mp3") == "mp3":
+                cfg["audio_format"] = "wav"
+                changed = True
+            if str(cfg.get("bitrate_kbps", 192)) == "192":
+                cfg["bitrate_kbps"] = 320
+                changed = True
+            cfg["_migrated_266"] = True
+            if changed:
+                try:
+                    save_config(cfg, config_path)
+                except Exception:
+                    pass
+        # v2.10.0：断点续跑出厂默认 True→False 的一次性迁移。旧配置里存的
+        # True 绝大多数是旧出厂默认（跟着配置一路存下来的），不是用户特意
+        # 勾的 —— 只翻这一次并落盘标记，之后用户再勾 True 永久尊重。
+        if isinstance(cfg, dict) and not cfg.get("_migrated_2100_skip"):
+            if cfg.get("skip_existing") is True:
+                cfg["skip_existing"] = False
+            cfg["_migrated_2100_skip"] = True
+            try:
+                save_config(cfg, config_path)
+            except Exception:
+                pass
+        return cfg
+    return {}
+
+
+def save_config(cfg: dict, config_path: Optional[Path] = None) -> Path:
+    """写配置到磁盘（UTF-8 / 不转义中文 / 缩进 2）。默认写 CONFIG_PATH。
+
+    v3.13.0 C2 起分流：通用键 → config.json（继续两机同步），
+    机器路径键 → config.local.json（merge 写回，两机 .stignore 排除）。
+    """
+    path = Path(config_path) if config_path else CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    machine = {k: cfg[k] for k in MACHINE_KEYS if k in cfg}
+    common = {k: v for k, v in cfg.items() if k not in MACHINE_KEYS}
+    path.write_text(json.dumps(common, ensure_ascii=False, indent=2), encoding="utf-8")
+    if machine:
+        lp = local_config_path(path)
+        local = _read_local(lp) or {}
+        local.update(machine)
+        lp.write_text(json.dumps(local, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+# ──────────────────── 交互向导辅助 ────────────────────
+
+def ask(prompt: str, default: str = "") -> str:
+    """交互式提问，支持回车取默认值"""
+    if default:
+        prompt = f"{prompt} [{default}]: "
+    else:
+        prompt = f"{prompt}: "
+    try:
+        val = input(prompt).strip()
+    except EOFError:
+        val = ""
+    return val if val else default
+
+
+def parse_bool(val: str, default: bool) -> bool:
+    """解析布尔输入：y/n/true/false/1/0，空取默认"""
+    v = val.strip().lower()
+    if v in ("y", "yes", "true", "1", "on"):
+        return True
+    if v in ("n", "no", "false", "0", "off"):
+        return False
+    return default
+
+
+def init_config(config_path: Path) -> dict:
+    """交互式初始化向导，让用户配置输出路径等参数，写入 config.json"""
+    print("=" * 56)
+    print("剪映批量导出音频 — 初始化向导")
+    print("（直接回车使用默认值；可随时重新运行 --init 修改）")
+    print("=" * 56)
+
+    # 预载现有配置作为默认值
+    current = load_config(config_path)
+
+    # 1. 输出目录（必填）
+    output_dir = ask("音频输出目录（必填）", current.get("output_dir", DEFAULT_CONFIG["output_dir"]) or DEFAULT_CONFIG["output_dir"])
+    # 兜底：连续空输入时回落到默认目录，避免 while 死循环把 CLI 卡死
+    tries = 0
+    while not output_dir and tries < 3:
+        print("  ⚠ 输出目录不能为空")
+        output_dir = ask("音频输出目录（必填）").strip() or ""
+        tries += 1
+    if not output_dir:
+        output_dir = DEFAULT_CONFIG["output_dir"]
+        print(f"  · 多次未输入，改用默认输出目录: {output_dir}")
+    try:
+        Path(output_dir).parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"  ⚠ 目录创建提示: {e}")
+
+    # 2. 输入目录
+    input_dir = ask("剪映草稿目录（留空自动定位）", current.get("input_dir", ""))
+
+    # 3. 命名模板
+    name_template = ask("命名模板", current.get("name_template", DEFAULT_CONFIG["name_template"]))
+
+    # 4. 音频格式
+    audio_format = ask("音频格式（mp3/wav）", current.get("audio_format", DEFAULT_CONFIG["audio_format"]))
+    if audio_format not in ("mp3", "wav"):
+        print(f"  ⚠ 未知格式 {audio_format}，回退 mp3")
+        audio_format = "mp3"
+
+    # 5. 码率
+    bitrate = ask("比特率 kbps（仅 mp3）", str(current.get("bitrate_kbps", DEFAULT_CONFIG["bitrate_kbps"])))
+    try:
+        bitrate = int(bitrate)
+    except ValueError:
+        bitrate = 192
+
+    # 6. 冲突策略
+    conflict = ask("重名冲突策略（rename/cover/skip）", current.get("conflict", DEFAULT_CONFIG["conflict"]))
+    if conflict not in ("rename", "cover", "skip"):
+        conflict = "rename"
+
+    # 7-9. 布尔项
+    dedupe = parse_bool(ask("启用内容去重？(y/n)", "y" if current.get("dedupe", True) else "n") or "y", True)
+    extract_video = parse_bool(ask("提取视频内嵌音轨？(y/n)", "y" if current.get("extract_video_tracks", True) else "n") or "y", True)
+    skip_existing = parse_bool(ask("断点续跑，跳过已处理草稿？(y/n)", "y" if current.get("skip_existing", False) else "n") or "n", False)
+
+    # 10. 备注（模板字段 {备注}）
+    remarks = ask("备注文案（命名模板 {备注} 字段，可留空）", current.get("remarks", ""))
+
+    # ⚠️ 合并式落盘（不是整体替换）：
+    # 向导只管它问到的这几个字段，其余字段（name_templates / name_templates_active /
+    # export_mode / track_name_template / track_spec / export_aaf / aaf_media_mode …）
+    # 必须原样保留 —— 早期写成「新建 dict 整体覆盖」，导致重跑 --init 会把用户
+    # 在界面里调好的多模板 / 多模式 / AAF 设置静默清空（2026-09-23 修复）。
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(current or {})          # 先叠磁盘现有值，保住用户自调项
+    cfg.update({                       # 再用本次向导结果覆盖问到的字段
+        "input_dir": input_dir,
+        "output_dir": output_dir,
+        "name_template": name_template,
+        "audio_format": audio_format,
+        "bitrate_kbps": bitrate,
+        "conflict": conflict,
+        "dedupe": dedupe,
+        "extract_video_tracks": extract_video,
+        "skip_existing": skip_existing,
+        "temp_dir": current.get("temp_dir", ""),
+        "remarks": remarks,
+    })
+
+    # v3.13.0 C2：改走 save_config 分流落盘 —— 机器路径键进 config.local.json，
+    # 通用键留 config.json；合并式语义（只覆盖本向导问到的字段）不变。
+    save_config(cfg, config_path)
+    print(f"\n✅ 配置已保存: {config_path}")
+    print(f"   输出目录: {output_dir}")
+    return cfg

@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""② 导入多轨页 —— 把 PT 工程（或交付包 json）写成剪映草稿的多轨结构。
+
+两种数据源（页面顶部切换）：
+
+  A) **Pro Tools 工程（需 PT 在线）**
+     点「① 解析 PT 工程」→ 通过 PTSL 向运行中的 Pro Tools 要会话信息 → 得到 pt-clips.json。
+     ⚠️ PTSL 不是文件解析器，它必须向「正在运行的 PT」发命令，
+        所以这一步**无法离线**。解析完就与 PT 无关了。
+
+  B) **交付包 json（完全离线）**
+     直接选别人发来的 `xxx.pt-clips.json`（音频在同级 audio/）。
+     无 PT、无原始工程路径也能导入 —— 这是跨设备场景的正解。
+
+两段式交互的用意：
+  「解析」与「写入」是**两个时刻**，各有前置条件，且条件互斥：
+    · 解析时：PT 必须在线（剪映开不开无所谓）
+    · 写入时：剪映必须关闭（PT 开不开无所谓）
+  所以拆成两个按钮，各自在自己的时刻检查自己的条件。这样「离线场景」
+  天然只走第 ② 步，不满足条件时按钮直接置灰，不会走到一半报错。
+"""
+
+import json
+import re
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox
+
+import main as core
+from .base import BaseTab, ScrollableFrame, default_draft_root, list_drafts
+from widgets import ToggleSwitch
+
+SRC_PT = "pt"
+SRC_JSON = "json"
+
+
+class ImportTab(BaseTab):
+    title = "导入多轨"
+    config_keys = ("import_json", "import_draft_dir", "import_exclude", "import_keep_aux")
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self._drafts = []
+        self._json_batch = None      # J10（v2.9.2）：多选 json 时的路径列表
+        self.build()
+
+    # ───────────── 界面 ─────────────
+
+    def build(self):
+        # G2/J12（D2 · 2026-09-27）：导入页信息也密，补齐滚动容器
+        # （写法与 export_tab 一致；窗口不够高时右侧出滚动条）。
+        outer = ScrollableFrame(self)
+        outer.pack(fill="both", expand=True)
+        outer = outer.inner
+
+        # ── 数据源（v3.14.0 B：LabelFrame → 双风格卡片壳）──
+        src_box = self.card(outer, "数据源")
+
+        self.var_src = tk.StringVar(value=self._guess_source())
+        src_row = ttk.Frame(src_box)
+        src_row.pack(fill="x")
+        ttk.Radiobutton(src_row, text="Pro Tools 工程（需 PT 在线）", value=SRC_PT,
+                        variable=self.var_src,
+                        command=self._on_source_change).pack(side="left", padx=(0, 18))
+        ttk.Radiobutton(src_row, text="交付包 json（完全离线）", value=SRC_JSON,
+                        variable=self.var_src,
+                        command=self._on_source_change).pack(side="left")
+
+        self.lbl_src_hint = ttk.Label(src_box, text="", foreground="#888", wraplength=760,
+                                      justify="left")
+        self.lbl_src_hint.pack(fill="x", pady=(4, 0))
+
+        # PT 文件行
+        self.row_pt = ttk.Frame(src_box)
+        self.var_ptx = tk.StringVar(value="")
+        ttk.Label(self.row_pt, text=".ptx 工程").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        # S8（v3.8.0）：宽度不写死 → 窄窗自动收窄，不再把整页顶出横滚条
+        ttk.Entry(self.row_pt, textvariable=self.var_ptx, width=1).grid(
+            row=0, column=1, sticky="we", padx=4, pady=3)
+        ttk.Button(self.row_pt, text="浏览…", command=self._pick_ptx).grid(row=0, column=2, padx=4)
+        self.lbl_pt_state = ttk.Label(self.row_pt, text="检测中…", foreground="#888")
+        self.lbl_pt_state.grid(row=0, column=3, sticky="w", padx=8)
+        self.btn_parse = ttk.Button(self.row_pt, text="① 解析 PT 工程",
+                                    command=self.parse_pt)
+        self.btn_parse.grid(row=0, column=4, padx=4)
+        self.row_pt.columnconfigure(1, weight=1)
+
+        # json 文件行
+        self.row_json = ttk.Frame(src_box)
+        self.var_json = tk.StringVar(value=self.cfg.get("import_json", ""))
+        ttk.Label(self.row_json, text="pt-clips.json").grid(
+            row=0, column=0, sticky="w", padx=4, pady=3)
+        ttk.Entry(self.row_json, textvariable=self.var_json, width=1).grid(
+            row=0, column=1, sticky="we", padx=4, pady=3)
+        ttk.Button(self.row_json, text="浏览…", command=self._pick_json).grid(row=0, column=2, padx=4)
+        self.lbl_json_state = ttk.Label(self.row_json, text="", foreground="#888")
+        self.lbl_json_state.grid(row=0, column=3, columnspan=2, sticky="w", padx=8)
+        self.row_json.columnconfigure(1, weight=1)
+
+        # ── 目标草稿 ──
+        dst_box = self.card(outer, "写入目标")
+
+        self.var_draft_dir = tk.StringVar(value=self.cfg.get("import_draft_dir", ""))
+        ttk.Label(dst_box, text="剪映草稿").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self.cmb_draft = ttk.Combobox(dst_box, textvariable=self.var_draft_dir, width=1)
+        self.cmb_draft.grid(row=0, column=1, sticky="we", padx=4, pady=3)
+        ttk.Button(dst_box, text="刷新列表", command=self.refresh_drafts).grid(row=0, column=2, padx=4)
+        ttk.Button(dst_box, text="浏览…", command=self._pick_draft_dir).grid(row=0, column=3, padx=4)
+        self.lbl_draft_state = ttk.Label(dst_box, text="", foreground="#888")
+        self.lbl_draft_state.grid(row=0, column=4, sticky="w", padx=8)
+        dst_box.columnconfigure(1, weight=1)
+
+        opt = ttk.Frame(dst_box)
+        opt.grid(row=1, column=0, columnspan=5, sticky="we", padx=4, pady=3)
+        ttk.Label(opt, text="排除轨道关键词").pack(side="left")
+        self.var_exclude = tk.StringVar(value=self.cfg.get("import_exclude", ""))
+        ttk.Entry(opt, textvariable=self.var_exclude, width=34).pack(side="left", padx=6)
+        ttk.Label(opt, text="（逗号分隔；留空 = 默认排除 VCA/Verb/Dly/BUS 等辅助轨）",
+                  foreground="#888").pack(side="left")
+        self.var_keep_aux = tk.BooleanVar(value=bool(self.cfg.get("import_keep_aux", False)))
+        ttk.Label(opt, text="保留辅助轨").pack(side="left")
+        ToggleSwitch(opt, value=self.var_keep_aux.get(),
+                     command=lambda v: self.var_keep_aux.set(v)
+                     ).pack(side="left", padx=5)
+
+        # ── 按钮 ──
+        btn_box = ttk.Frame(outer)
+        btn_box.pack(fill="x", padx=8, pady=(0, 4))
+        self.btn_preview = ttk.Button(btn_box, text="预演（不写入）", command=self.preview)
+        self.btn_preview.pack(side="left", padx=4)
+        self.btn_import = ttk.Button(btn_box, text="② 导入到剪映草稿", command=self.do_import)
+        self.btn_import.pack(side="right", padx=4)
+        self.btn_import.configure(style="Accent.TButton")
+
+        ttk.Label(outer,
+                  text=("流程：① 解析/选择数据源 → ② 选目标草稿 → ③ 点导入。\n"
+                        "· 选 .ptx 时 Pro Tools 必须已打开该工程；选 json 则完全离线。\n"
+                        "· 写入前请【完全退出剪映】—— 否则剪映会用内存里的旧内容覆盖写入。"),
+                  foreground="#777", justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+
+        self.make_log(outer, height=12)
+
+        self._on_source_change()
+        self.refresh_drafts()
+
+    def _guess_source(self) -> str:
+        """默认选中：已存 json 就用 json 模式，否则 PT 模式。"""
+        return SRC_JSON if self.cfg.get("import_json") else SRC_PT
+
+    # ───────────── 状态联动 ─────────────
+
+    def _on_source_change(self):
+        is_pt = self.var_src.get() == SRC_PT
+        self.row_pt.pack(fill="x", pady=(6, 0)) if is_pt else self.row_pt.pack_forget()
+        self.row_json.pack(fill="x", pady=(6, 0)) if not is_pt else self.row_json.pack_forget()
+
+        if is_pt:
+            self.lbl_src_hint.configure(
+                text=("⚠️ 解析 .ptx 必须由**正在运行的 Pro Tools** 提供数据"
+                      "（PTSL 是客户端不是文件解析器），因此这一步无法离线。"
+                      "解析成功后即与 PT 无关，可关闭 PT。\n"
+                      "需要给剪辑/其他机器导入时，请用 pt-tools「扫描建档 → 生成交付包」"
+                      "（v2.7.0 起③页退役，交付包在那边一步直出）。"))
+        else:
+            self.lbl_src_hint.configure(
+                text=("✓ 完全离线：直接选交付包里的 pt-clips.json，音频从同级的 audio/ 目录读取。"
+                      "不需要 Pro Tools，也不需要原始工程路径。"))
+        self.refresh_states()
+
+    def refresh_states(self):
+        """刷新 PT / 剪映 / json 的状态提示，并按前置条件启用或禁用按钮。
+
+        ⚠️ **本函数在主线程被高频调用**（切页 / 选文件 / 刷草稿列表 / 任务完成
+        共 8 个触发点），因此**绝不能在这里做同步探测** —— 一次
+        ``pro_tools_status()`` 就要 0.4~0.7s（tasklist 0.43s + 端口探活超时），
+        正是 2026-09-19 用户反馈的「切页卡顿」主因。
+
+        现在改为**读共享探测器的缓存**（后台线程在跑，状态栏用的就是同一份），
+        瞬时返回；缓存还没就绪时按「检测中」显示并暂时禁用按钮，
+        等 ``StatusProbe`` 回调后由主窗口再触发一次 ``refresh_states()``。
+        """
+        # PT 状态（只在 PT 模式下需要）—— 读缓存，不探测
+        if self.var_src.get() == SRC_PT:
+            cached = None
+            try:
+                cached = self.app._probe.get_cached()
+            except Exception:
+                cached = None
+            if cached and cached.get("pt") and cached["pt"][1]:
+                ok, msg = cached["pt"]
+                self.lbl_pt_state.configure(text=("✓ " if ok else "✗ ") + msg,
+                                            foreground=("#2e7d32" if ok else "#c62828"))
+                self.btn_parse.configure(state="normal" if ok else "disabled")
+            else:
+                # 探测尚未就绪：给中性提示，按钮先禁用（避免用户点了才失败）
+                self.lbl_pt_state.configure(text="… 正在检测 Pro Tools 状态",
+                                            foreground="#888")
+                self.btn_parse.configure(state="disabled")
+        else:
+            self.lbl_pt_state.configure(text="")
+            self.btn_parse.configure(state="disabled")
+
+        # json 状态（J10：批量多选时显示批概要，单文件路径才做文件级检查）
+        jp = Path(self.var_json.get().strip()) if self.var_json.get().strip() else None
+        json_kind = None
+        if self._json_batch:
+            ok_n = sum(1 for b in self._json_batch if b.is_file())
+            self.lbl_json_state.configure(
+                text=f"✓ 批量 {len(self._json_batch)} 个 json（{ok_n} 个在位）",
+                foreground="#2e7d32" if ok_n == len(self._json_batch) else "#ef6c00")
+        elif jp and jp.is_file():
+            try:
+                doc, n_wav, is_pkg = self._json_summary(jp)
+                json_kind = self._json_kind(doc)
+                if json_kind != "pt-clips":
+                    # v2.10.0（Q6）：档案/未知结构直接红字说明，不再假装 ✓
+                    self.lbl_json_state.configure(
+                        text=("✗ 这是 PT 档案（pt-profile），不是片段清单 —— "
+                              "没有可导入的片段。请选交付包里的 pt-clips.json"
+                              "（pt-tools「扫描建档」页点「生成交付包」生成）"),
+                        foreground="#c62828")
+                else:
+                    n_track = len(doc.get("tracks", []))
+                    n_clip = sum(len(t.get("clips", [])) for t in doc.get("tracks", []))
+                    audio_dir = jp.parent / "audio"
+                    extra = ""
+                    if is_pkg or audio_dir.is_dir():
+                        extra = f"｜音频 {n_wav} 个（包内 audio/）"
+                    elif doc.get("online_files"):
+                        extra = "｜素材指向原始路径（本机自用）"
+                    self.lbl_json_state.configure(
+                        text=f"✓ {n_track} 轨 / {n_clip} 片段{extra}", foreground="#2e7d32")
+            except Exception as e:
+                self.lbl_json_state.configure(text=f"✗ 解析失败: {e}", foreground="#c62828")
+        elif jp:
+            self.lbl_json_state.configure(text="✗ 文件不存在", foreground="#c62828")
+        else:
+            self.lbl_json_state.configure(text="")
+
+        # 剪映状态（写入前置条件）
+        draft = Path(self.var_draft_dir.get().strip()) if self.var_draft_dir.get().strip() else None
+        ready = bool(jp and jp.is_file() and json_kind == "pt-clips"
+                     and draft and draft.is_dir())
+        if draft and draft.is_dir():
+            blockers, warns = self._jy_state(draft)
+            if blockers:
+                self.lbl_draft_state.configure(
+                    text="✗ 剪映正在运行，导入会无效", foreground="#c62828")
+                ready = False
+            elif warns:
+                self.lbl_draft_state.configure(text="! " + warns[0].split("（")[0],
+                                               foreground="#ef6c00")
+            else:
+                self.lbl_draft_state.configure(text="✓ 可以写入", foreground="#2e7d32")
+        elif draft:
+            self.lbl_draft_state.configure(text="✗ 目录不存在", foreground="#c62828")
+        else:
+            self.lbl_draft_state.configure(text="", foreground="#888")
+            ready = False
+
+        if self._json_batch:
+            ready = bool(self._json_batch)      # 批量：目标草稿在每个工程的对话框里选
+        state = "normal" if ready else "disabled"
+        self.btn_import.configure(state=state)
+        self.btn_preview.configure(
+            state="normal" if (self._json_batch or (jp and jp.is_file())) else "disabled")
+
+    @staticmethod
+    def _json_kind(doc) -> str:
+        """识别 json 类型（v2.10.0 · Q6）。
+
+        - ``pt-clips``   片段清单：tracks[].clips[] 存在（交付包 / 解析产物）
+        - ``pt-profile`` 扫描建档的**档案**：有 session/tracks 但轨上没有 clips
+          —— 只记录轨清单，没有可导入的片段。2026-09-27 用户把它喂给导入页，
+          0 片段导入却显示「成功」，即「没跑通」的直接原因。
+        - ``unknown``    其余未知结构
+        """
+        tracks = doc.get("tracks")
+        if isinstance(tracks, list) and any(
+                isinstance(t, dict) and "clips" in t for t in tracks):
+            return "pt-clips"
+        if doc.get("session") and isinstance(tracks, list):
+            return "pt-profile"
+        return "unknown"
+
+    def _json_summary(self, jp: Path):
+        """读 pt-clips.json 概要：``(doc, wav_count, is_delivery_package)``。
+
+        **带 mtime 缓存**：``refresh_states`` 会在每次切页/选文件时调到这里，
+        而 json 有 58KB、`glob("*.wav")` 在交付包里要扫几百个文件 ——
+        每次都重读会让切页明显发涩（2026-09-19 实测 ~50ms/次）。
+        文件没被改过（mtime+size 都没变）就直接复用上次结果。
+        """
+        try:
+            st = jp.stat()
+            key = (str(jp), st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key is not None and getattr(self, "_jsum_key", None) == key:
+            return self._jsum_val
+        doc = json.loads(jp.read_text(encoding="utf-8"))
+        is_pkg = bool(doc.get("_delivery_package"))
+        audio_dir = jp.parent / "audio"
+        n_wav = len(list(audio_dir.glob("*.wav"))) if audio_dir.is_dir() else 0
+        val = (doc, n_wav, is_pkg)
+        if key is not None:
+            self._jsum_key = key
+            self._jsum_val = val
+        return val
+
+    @staticmethod
+    def _jy_state(draft: Path, realtime: bool = False):
+        """复用导入器的剪映检测（同一判据，避免两处不一致）。
+
+        ``realtime=False``（默认，用于状态提示/按钮门控）：可吃 tasklist 缓存，
+        省掉每次 ``refresh_states()`` 的 ~0.5s 进程枚举 —— ``refresh_states``
+        被切页、选文件、刷草稿列表等 8 个点触发，是切页卡顿的主要来源。
+
+        ``realtime=True``（**真正点下「导入」时**）：强制实时枚举，
+        因为这是最后一次拦截机会，缓存 5 秒的误差会放过「刚打开剪映」。
+        """
+        try:
+            import import_audio
+            if realtime:
+                return import_audio.jianying_running_realtime(draft)
+            return import_audio.jianying_running(draft)
+        except Exception:
+            return [], []
+
+    def on_show(self):
+        self.refresh_states()
+
+    def collect(self):
+        self.cfg["import_json"] = self.var_json.get().strip()
+        self.cfg["import_draft_dir"] = self.var_draft_dir.get().strip()
+        self.cfg["import_exclude"] = self.var_exclude.get().strip()
+        self.cfg["import_keep_aux"] = bool(self.var_keep_aux.get())
+
+    def apply_config(self):
+        """把 self.cfg 的值刷回控件（菜单「重新载入配置」「默认路径」后调用）。"""
+        c = self.cfg
+        self.var_json.set(c.get("import_json", ""))
+        self.var_draft_dir.set(c.get("import_draft_dir", ""))
+        self.var_exclude.set(c.get("import_exclude", ""))
+        self.var_keep_aux.set(bool(c.get("import_keep_aux", False)))
+        self.var_src.set(self._guess_source())
+        self._on_source_change()
+
+    # ───────────── 选择器 ─────────────
+
+    def _pick_ptx(self):
+        p = self.ask_file("选择 Pro Tools 工程（.ptx）", initial=self.var_ptx.get(),
+                          filetypes=[("Pro Tools 工程", "*.ptx;*.ptf;*.sesx"),
+                                     ("所有文件", "*.*")])
+        if p:
+            self.var_ptx.set(p)
+            self.refresh_states()
+
+    def _pick_json(self):
+        # J10（v2.9.2）：支持多选 —— 一次勾选多个交付包 json 批量导入。
+        # 多选时 var_json 只显示占位文案，真实列表在 self._json_batch。
+        from tkinter import filedialog
+        ps = filedialog.askopenfilenames(
+            title="选择 pt-clips.json（可按住 Ctrl 多选批量导入）",
+            initialdir=self.var_json.get() or None,
+            filetypes=[("PT 解析结果", "*.json"), ("所有文件", "*.*")])
+        if not ps:
+            return
+        if len(ps) == 1:
+            self._json_batch = None
+            self.var_json.set(ps[0])
+        else:
+            self._json_batch = [Path(x) for x in ps]
+            self.var_json.set(f"（已选 {len(ps)} 个 json，批量导入）")
+        self.refresh_states()
+
+    def _pick_draft_dir(self):
+        p = self.ask_dir("选择剪映草稿文件夹", initial=self.var_draft_dir.get())
+        if p:
+            self.var_draft_dir.set(p)
+            self.refresh_states()
+
+    def refresh_drafts(self):
+        """从剪映默认草稿目录拉草稿列表填进下拉框。"""
+        root = default_draft_root()
+        self._drafts = list_drafts(root)
+        names = [d.name for d in self._drafts]
+        self.cmb_draft.configure(values=names)
+        if names and not self.var_draft_dir.get().strip():
+            self.var_draft_dir.set(str(root / names[0]))
+        elif names:
+            cur = Path(self.var_draft_dir.get().strip()).name
+            if cur in names:
+                self.var_draft_dir.set(str(root / cur))
+        self.log(f"· 草稿目录：{root}\n· 发现 {len(names)} 个草稿"
+                 f"{'：' + '、'.join(names[:8]) + ('…' if len(names) > 8 else '') if names else ''}\n")
+        self.refresh_states()
+
+    # ───────────── ① 解析 PT ─────────────
+
+    def parse_pt(self):
+        if self.running:
+            return
+        ptx = self.var_ptx.get().strip()
+        if not ptx:
+            self.warn("缺少工程文件", "请先选择 .ptx 工程文件。")
+            return
+        # 这里是**用户点按钮时**的前置校验（低频、且此刻界面可以短暂无响应）：
+        # 有意用同步实时探测而不是读缓存 —— 点了「解析」就该拿到确定结论，
+        # 拿 5 秒前的缓存糊弄会导致「以为能解析，结果 PTSL 刚断」。
+        # 高频路径（切页/选文件刷新门控）才必须用缓存，见 refresh_states。
+        ok, msg = core.pro_tools_status()
+        if not ok:
+            self.error("Pro Tools 不可用", msg)
+            return
+
+        out_dir = self._default_json_dir()
+        self.var_json.set(str(out_dir / "pt-clips.json"))
+
+        def job():
+            import sys
+            import pt_clip_scan
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+            args = _PTArgs(out=str(out_dir), name="pt-clips.json",
+                           tracks="", exclude="")
+            pt_clip_scan.run(args)
+
+        def done(err):
+            if err is None:
+                p = out_dir / "pt-clips.json"
+                if p.is_file():
+                    self.var_json.set(str(p))
+                    self.var_src.set(SRC_JSON)      # 解析完自动切到「用 json」路径
+                    self._on_source_change()
+                    self.log(f"\n✓ 解析完成，已切到「交付包 json」模式：{p}\n")
+                    return
+            self.log("\n✗ 解析失败，请确认：PT 已打开目标工程 / PTSL 已启用 / "
+                     "py-ptsl 已安装。\n")
+            self.refresh_states()
+
+        self.run_async(job, on_done=done, btn=self.btn_parse, busy_text="解析中…")
+
+    def _default_json_dir(self) -> Path:
+        """解析结果的落点：优先用户指定的交付包输出目录，否则默认工作目录。"""
+        pkg = self.cfg.get("import_pkg_out", "").strip()
+        if pkg:
+            p = Path(pkg)
+        else:
+            p = core.APP_DIR / "工作目录"
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            p = Path.cwd()
+        return p
+
+    # ───────────── ② 预演 / 导入 ─────────────
+
+    def _exclude_args(self):
+        ex_raw = self.var_exclude.get().strip()
+        ex = [s.strip().lower() for s in re.split(r"[,，]", ex_raw) if s.strip()]
+        keep = bool(self.var_keep_aux.get())
+        if not ex and not keep:
+            import import_audio
+            ex = list(import_audio.DEFAULT_EXCLUDE)
+        return tuple(ex)
+
+    def preview(self):
+        if self.running:
+            return
+        ex = self._exclude_args()
+        if self._json_batch:
+            paths = list(self._json_batch)
+            if not all(x.is_file() for x in paths):
+                self.warn("缺少数据源", "批量列表里有 json 已不在位，请重新选择。")
+                return
+
+            def job():
+                import import_audio
+                for k, x in enumerate(paths, 1):
+                    rows = import_audio.parse_pt_clips(x, ex)
+                    print(f"\n=== [{k}/{len(paths)}] {x.name} ===")
+                    _print_rows_digest(rows)
+                print("\n（预演不写任何文件）")
+
+            self.run_async(job, btn=self.btn_preview, busy_text="预演中…")
+            return
+        jp = Path(self.var_json.get().strip())
+        if not jp.is_file():
+            self.warn("缺少数据源", "请先选择 pt-clips.json。")
+            return
+
+        def job():
+            import import_audio
+            rows = import_audio.parse_pt_clips(jp, ex)
+            print(f"\n数据源: {jp.name}")
+            print(f"可用片段 {len(rows)} 个，涉及素材 "
+                  f"{len({r['source'] for r in rows})} 个\n")
+            if not rows:
+                # v2.6.5（J7）：诊断细节由 parse_pt_clips 的 [diag] 段输出
+                print("（预演不写任何文件）")
+                return
+            by_track = {}
+            for r in rows:
+                by_track.setdefault(r["_pt_track"], []).append(r)
+            for tname, items in by_track.items():
+                n_fade = sum(1 for i in items
+                             if i.get("_fade_in_ms") or i.get("_fade_out_ms"))
+                print(f"  轨 {tname:<26} 片段 {len(items):>3} 个"
+                      f"{f'  含 fade {n_fade} 个' if n_fade else ''}")
+            n_fade = sum(1 for r in rows if r.get("_fade_in_ms") or r.get("_fade_out_ms"))
+            last = max((r["start_ms"] + int(r["duration_ms"]) for r in rows), default=0)
+            print(f"\n合计：{len(by_track)} 条轨道 / {len(rows)} 个片段 / "
+                  f"{n_fade} 个淡入淡出 / 时间线总长 {last/1000:.1f}s")
+            print("（预演不写任何文件）")
+
+        self.run_async(job, btn=self.btn_preview, busy_text="预演中…")
+
+    def do_import(self):
+        if self.running:
+            return
+        if self._json_batch:
+            return self._do_import_batch()
+        jp = Path(self.var_json.get().strip())
+        draft = Path(self.var_draft_dir.get().strip())
+        if not jp.is_file():
+            self.warn("缺少数据源", "请先选择 pt-clips.json。")
+            return
+        # v2.10.0（Q6）：硬拦截档案文件 —— 旧版喂进 pt-profile 会「0 片段导入
+        # 成功」，日志显示任务成功、草稿却毫无变化，用户无从判断错在哪。
+        try:
+            doc = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.error("数据源不可读", f"{jp.name}\n{e}")
+            return
+        if self._json_kind(doc) != "pt-clips":
+            self.error(
+                "选错文件：这不是片段清单",
+                f"「{jp.name}」是 PT 扫描档案（pt-profile），只记录轨道清单、"
+                "没有任何片段，导入它什么都写不进草稿。\n\n"
+                "正确数据源二选一：\n"
+                "· pt-tools「扫描建档」页点「生成交付包」→ 选包里的 pt-clips.json；\n"
+                "· 或本页选「Pro Tools 工程」点「① 解析 PT 工程」直接生成。")
+            return
+        if not draft.is_dir():
+            self.warn("缺少目标", "请选择要写入的剪映草稿文件夹。")
+            return
+        # 最后一次拦截：用实时结果，不吃缓存（statusbar 的门控可以吃缓存，
+        # 但真正落盘前必须确认剪映此刻确实没在跑）
+        blockers, _warns = self._jy_state(draft, realtime=True)
+        if blockers:
+            self.error(
+                "剪映正在运行",
+                "导入前必须【完全退出剪映】（含托盘图标与后台进程）。\n\n"
+                "原因：剪映内存里持有草稿副本，退出时会用旧内容覆盖磁盘写入 —— "
+                "结果就是「导入了但剪映里看不到变化」。\n\n"
+                + "\n".join(blockers))
+            return
+
+        ex = self._exclude_args()
+        self.save_config(quiet=True)
+
+        def job():
+            import sys
+            import import_audio
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+            argv = ["import_audio.py", "--pt-clips", str(jp), str(draft)]
+            if ex:
+                argv += ["--exclude", ",".join(ex)]
+            old = sys.argv
+            sys.argv = argv
+            try:
+                import_audio.main()
+            finally:
+                sys.argv = old
+
+        def done(err):
+            if err is None:
+                self.log("\n✓ 导入完成。请打开剪映确认轨道/片段/淡入淡出。\n")
+            else:
+                self.log(f"\n✗ 导入失败: {err}\n")
+            self.refresh_states()
+
+        self.run_async(job, on_done=done, btn=self.btn_import, busy_text="写入中…")
+
+    # ───────────── ②' 批量导入（J10，v2.9.2）─────────────
+
+    def _do_import_batch(self):
+        """多工程横向导入：逐个弹「轨道勾选 + 目标草稿」对话框收集计划，
+        全部确认后统一执行（中途取消不产生半成品）。"""
+        paths = [x for x in self._json_batch if x.is_file()]
+        if not paths:
+            self.warn("缺少数据源", "批量列表里的 json 都不在位，请重新选择。")
+            return
+        ex = self._exclude_args()
+        draft_names = [d.name for d in self._drafts]
+        cur_draft = self.var_draft_dir.get().strip()
+        plan = []
+        for x in paths:
+            dlg = _BatchPickDialog(self, x, draft_names, cur_draft)
+            self.wait_window(dlg)
+            if dlg.result is None:
+                self.log("\n（批量导入已取消，未写入任何草稿）\n")
+                return
+            if dlg.result == "skip":
+                self.log(f"· 批量：跳过 {x.name}\n")
+                continue
+            plan.append((x, dlg.result[0], dlg.result[1]))
+        if not plan:
+            self.log("\n（批量：没有要导入的工程）\n")
+            return
+        # 统一校验：目标草稿在位 + 剪映此刻没在跑（realtime，最后一次拦截）
+        for x, dft, _only in plan:
+            if not dft.is_dir():
+                self.error("目标不存在", f"{x.name}\n目标草稿不存在：\n{dft}")
+                return
+            blockers, _w = self._jy_state(dft, realtime=True)
+            if blockers:
+                self.error(
+                    "剪映正在运行",
+                    f"{x.name} → {dft.name}\n\n" + "\n".join(blockers)
+                    + "\n\n批量导入已中止，未写入任何草稿。")
+                return
+        self.save_config(quiet=True)
+
+        def job():
+            import sys
+            import import_audio
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+            ok, fail = 0, []
+            for k, (x, dft, only) in enumerate(plan, 1):
+                print(f"\n════ [{k}/{len(plan)}] {x.name} → {dft.name} ════")
+                argv = ["import_audio.py", "--pt-clips", str(x), str(dft)]
+                if ex:
+                    argv += ["--exclude", ",".join(ex)]
+                if only:
+                    argv += ["--only", ",".join(only)]
+                old = sys.argv
+                sys.argv = argv
+                try:
+                    import_audio.main()
+                    ok += 1
+                except SystemExit as e:
+                    fail.append(f"{x.name}（exit {e.code}）")
+                except BaseException as e:
+                    fail.append(f"{x.name}（{e}）")
+                finally:
+                    sys.argv = old
+            print(f"\n════ 批量导入结束：成功 {ok} / {len(plan)}")
+            if fail:
+                print("失败：\n  " + "\n  ".join(fail))
+
+        def done(err):
+            if err is None:
+                self.log("\n✓ 批量导入流程结束（各工程结果见上方日志）。\n")
+            else:
+                self.log(f"\n✗ 批量导入失败: {err}\n")
+            self.refresh_states()
+
+        self.run_async(job, on_done=done, btn=self.btn_import, busy_text="批量写入中…")
+
+
+class _BatchPickDialog(tk.Toplevel):
+    """J10 批量导入：单个工程的「轨道勾选 + 目标草稿」对话框。
+
+    result：None=取消全部；"skip"=跳过此工程；(draft_path, only_tuple)=确认。
+    """
+
+    def __init__(self, master, jp: Path, draft_names, cur_draft: str):
+        super().__init__(master)
+        self.title(f"勾选轨道 · {jp.name}")
+        self.result = None
+        self.transient(master)
+        self.grab_set()
+        self.resizable(False, True)
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        try:
+            import import_audio
+            names = import_audio.list_track_names(jp)
+        except Exception:
+            names = []
+        if not names:
+            names = []
+            self._no_names = True
+        else:
+            self._no_names = False
+
+        ttk.Label(frm, text=f"工程：{jp.parent.name} / {jp.name}",
+                  foreground="#555").pack(anchor="w", pady=(0, 6))
+
+        box = ttk.LabelFrame(frm, text="要导入的轨道（默认全选；日志框等自身可滚控件让位）",
+                             padding=8)
+        box.pack(fill="both", expand=True)
+        self._tvars = []
+        if names:
+            inner = ttk.Frame(box)
+            inner.pack(fill="both", expand=True)
+            half = (len(names) + 1) // 2
+            for i, n in enumerate(names):
+                v = tk.BooleanVar(value=True)
+                ttk.Checkbutton(inner, text=n, variable=v).grid(
+                    row=i % half, column=i // half, sticky="w", padx=6, pady=1)
+                self._tvars.append((n, v))
+            ctl = ttk.Frame(box)
+            ctl.pack(fill="x", pady=(6, 0))
+            ttk.Button(ctl, text="全选", width=6,
+                       command=lambda: [v.set(True) for _n, v in self._tvars]).pack(side="left")
+            ttk.Button(ctl, text="全不选", width=6,
+                       command=lambda: [v.set(False) for _n, v in self._tvars]).pack(side="left", padx=6)
+            ttk.Label(ctl, text=f"共 {len(names)} 条音频轨", foreground="#888").pack(side="left", padx=8)
+        else:
+            ttk.Label(box, text="（轨名解析失败——确认后将导入全部轨道）",
+                      foreground="#ef6c00").pack(anchor="w")
+
+        dbox = ttk.LabelFrame(frm, text="目标草稿（每个工程各选一个）", padding=8)
+        dbox.pack(fill="x", pady=(8, 0))
+        self.var_draft = tk.StringVar(value=cur_draft)
+        # S11：去掉写死 width=46（列已配 weight=1），改随格弹性伸缩
+        ttk.Combobox(dbox, textvariable=self.var_draft,
+                     values=draft_names).grid(row=0, column=0, sticky="we", padx=4)
+        dbox.columnconfigure(0, weight=1)
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="取消全部", command=self._cancel).pack(side="right", padx=4)
+        ttk.Button(btns, text="跳过此工程", command=self._skip).pack(side="right", padx=4)
+        b = ttk.Button(btns, text="导入此工程 ✓", command=self._ok, style="Accent.TButton")
+        b.pack(side="right", padx=4)
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self._cancel())
+
+    def _ok(self):
+        if self._no_names:
+            self.result = (Path(self.var_draft.get().strip()), ())
+        else:
+            only = tuple(n for n, v in self._tvars if v.get())
+            self.result = (Path(self.var_draft.get().strip()), only)
+        self.destroy()
+
+    def _skip(self):
+        self.result = "skip"
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+def _print_rows_digest(rows):
+    """批量预演：打印一个 json 的行摘要（与单选 preview 同口径）。"""
+    if not rows:
+        print("  （无可用片段）")
+        return
+    by_track = {}
+    for r in rows:
+        by_track.setdefault(r["_pt_track"], []).append(r)
+    for tname, items in by_track.items():
+        print(f"  轨 {tname:<26} 片段 {len(items):>3} 个")
+    print(f"  合计：{len(by_track)} 条轨 / {len(rows)} 个片段")
+
+
+class _PTArgs:
+    """pt_clip_scan.run() 需要的参数容器（避免为 GUI 改动其 argparse 定义）。"""
+
+    def __init__(self, **kw):
+        self.out = "."
+        self.name = "pt-clips.json"
+        self.tracks = ""
+        self.exclude = ""
+        self.__dict__.update(kw)

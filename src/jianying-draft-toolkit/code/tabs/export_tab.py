@@ -1,0 +1,1069 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""① 导出音频页 —— 剪映草稿 → 切片导出（原 06 项目的全部功能）。
+
+与其他两页完全独立：输入源、输出目录、命名规则都用自己的配置字段。
+"""
+
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox
+
+import main as core
+from .base import BaseTab, ScrollableFrame
+
+# ---------------------------------------------------------------------------
+# 下拉「显示名 ⇄ 内部 key」（v2.6.2 · Q9 Q11）
+#
+# 旧版把内部 key 直接拼进显示串（"48k24b_st  48k/24bit 立体声"、
+# "media  AAF + Media 文件夹"），用户看到的是给程序读的英文；更糟的是
+# `_read_spec()` 取首 token 当 key、查不到就**静默回落默认值且不报错** ——
+# 用户以为选了 44.1k/16bit，实际导出的是默认值。现在：显示名里只有人话，
+# 取不回 key 就 **显式报错**（见 _read_spec / _read_aaf_mode / _read_conflict）。
+# ---------------------------------------------------------------------------
+SPEC_LABEL_TO_KEY = {v[0]: k for k, v in core.SPEC_PRESETS.items()}
+AAF_MODES = {
+    "media": "AAF + Media 文件夹（推荐，便于核对素材）",
+    "embed": "仅单个 .aaf 文件（体积小，不含素材副本）",
+}
+AAF_LABEL_TO_KEY = {v: k for k, v in AAF_MODES.items()}
+CONFLICT_MODES = {
+    "rename": "自动重命名（两份都留）",
+    "cover": "覆盖同名文件",
+    "skip": "跳过不导出",
+}
+CONFLICT_LABEL_TO_KEY = {v: k for k, v in CONFLICT_MODES.items()}
+
+# v2.10.0（Q1）：片段命名 {素材类型} 的手动覆盖值。
+# v3.10.0（R-码表）：码表收敛为四桶（自动判定走 main.classify_clip_type，
+# 按素材命名信息归类；输入框仍可自由填，不限于下拉值）：
+#   DX=对白（台词/内心VO/画外音OS）  FX=音效（动效/拟音）
+#   BG=环境（背景）                  MX=音乐
+# 旧值 audio/voice/music/sfx/AMB/DIA/MUS 退役（导入方向 CATEGORY_MAP 不受影响）。
+CLIP_TYPE_AUTO_LABEL = "自动判定（按素材名归类 DX/FX/BG/MX）"
+CLIP_TYPE_VALUES = ("DX", "FX", "BG", "MX")
+
+
+def normalize_template_entry(e):
+    """J1（v2.7.0）：模板条目归一 —— str → {"name": …, "template": …}。
+
+    名字缺省取模板串前 12 字符；dict 缺 name 时同样补。名字只用于显示，
+    渲染与兼容字段（name_template）始终用 template 串。
+    """
+    if isinstance(e, dict):
+        tpl = str(e.get("template", "")).strip()
+        name = str(e.get("name", "")).strip() or tpl[:12] or "模板"
+        return {"name": name, "template": tpl}
+    tpl = str(e).strip()
+    return {"name": tpl[:12] or "模板", "template": tpl}
+
+
+class ExportTab(BaseTab):
+    title = "导出音频"
+    config_keys = (
+        "input_dir", "output_dir", "name_template", "audio_format", "bitrate_kbps",
+        "conflict", "dedupe", "extract_video_tracks", "skip_existing", "remarks",
+        "export_mode", "track_name_template", "track_spec", "export_aaf",
+        "aaf_media_mode", "export_subtitles", "split_folder_template",
+        "split_by_video", "video_project_answers", "clip_type_override",
+    )
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.dropped_paths = []
+        self.build()
+
+    # ───────────── 界面 ─────────────
+
+    def build(self):
+        # G2/J12（v2.6.6）：导出页信息最密，套可滚动容器 —— 窗口不够高时
+        # 右侧出滚动条，滚轮可滚（日志框/列表框上滚轮自动让位给它们）。
+        outer = ScrollableFrame(self)
+        outer.pack(fill="both", expand=True)
+        outer = outer.inner
+
+        # ── 输入源（v2.6.3 · 五.2 合并）──
+        # 旧版有**两处**输入入口：「导出配置」里的「剪映草稿目录」行 +
+        # v2.6.2 新加的「输入源」按钮框，功能高度重复、视觉上像两套系统。
+        # 现在合并为一个块：手填 / 浏览目录 / 选文件 / 拖拽 全走这里，
+        # 识别状态就地反馈。拖拽能力保留在代码层（主窗口转发 on_drop）。
+        # v3.13.0 C3（B3 回滚补做）：长括号标题降级为「短标题 + 灰 caption」。
+        # 教训钉死：parent 走 pack，caption 也必须 pack（B3 曾误用 grid 撞冲突）。
+        # v3.14.0 B：LabelFrame → 双风格卡片壳（card() 返回 .body，卡内
+        # 布局写法不变）；教训钉死：parent 走 pack，caption 也必须 pack
+        #（B3 曾误用 grid 撞冲突）。
+        src_box = self.card(outer, "输入源")
+        ttk.Label(outer, style="Small.TLabel",
+                  text="草稿根目录 / 单个草稿 / 草稿或音视频文件，也可直接拖进窗口",
+                  ).pack(fill="x", padx=12, pady=(0, 6))
+
+        self.var_input_dir = tk.StringVar(value=self.cfg.get("input_dir", ""))
+        src_row = ttk.Frame(src_box)
+        src_row.grid(row=0, column=0, columnspan=2, sticky="we", pady=2)
+        ttk.Label(src_row, text="剪映草稿目录").pack(side="left")
+        self.entry_input_dir = ttk.Entry(src_row, textvariable=self.var_input_dir)
+        self.entry_input_dir.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(src_row, text="浏览目录…",
+                   command=self._browse_input_dir).pack(side="left", padx=2)
+        ttk.Button(src_row, text="选择文件…",
+                   command=self._pick_input_files).pack(side="left", padx=2)
+
+        src_row2 = ttk.Frame(src_box)
+        src_row2.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        ttk.Button(src_row2, text="✗ 清空", width=6,
+                   command=self._clear_dropped,
+                   style="Danger.TButton").pack(side="left")
+        ttk.Button(src_row2, text="重新识别", width=9,
+                   command=self._refresh_input_summary).pack(side="left", padx=(6, 0))
+        self.var_input_summary = tk.StringVar(value="")
+        ttk.Label(src_row2, textvariable=self.var_input_summary,
+                  foreground="#2a9").pack(side="left", padx=10)
+        ttk.Label(src_box,
+                  text="目录内容变化即自动识别；「选择文件…」可多选草稿 json / 音视频文件。",
+                  foreground="#888").grid(row=2, column=0, columnspan=2,
+                                          sticky="w", pady=(4, 0))
+        src_box.columnconfigure(0, weight=1)
+        # 目录内容变化即刷新识别结果（手填路径也生效，不只浏览按钮）
+        self.var_input_dir.trace_add("write", lambda *a: self._schedule_input_summary())
+
+        # ── 导出模式（整轨 / 片段 可多选，同时勾选则一次导出两种产物）──
+        mode_box = self.card(outer, "导出模式")
+        ttk.Label(outer, style="Small.TLabel",
+                  text="可多选：同时勾选则一次导出「整轨 + 片段」",
+                  ).pack(fill="x", padx=12, pady=(0, 6))
+
+        mset = self._mode_set()
+        self.var_mode_tracks = tk.BooleanVar(value="tracks" in mset)
+        self.var_mode_clips = tk.BooleanVar(value="clips" in mset)
+        ttk.Checkbutton(
+            mode_box, text="① 导出音频轨道（整轨：一条轨一个 WAV，等长对齐，导入 PT 即就位）",
+            variable=self.var_mode_tracks, command=self._sync_mode,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(
+            mode_box, text="② 导出音频素材（片段：一段一个文件，用于取素材/建素材库）",
+            variable=self.var_mode_clips, command=self._sync_mode,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+
+        # v2.6.2 布局修正：旧版「整轨规格」下拉与「整轨命名」Label **都占了
+        # row2/column1**，Label 又被 sticky="e" 挤到右边 —— 视觉上就是下拉框的
+        # 边框被压掉一截。现在各占一行，不再抢格。
+        ttk.Label(mode_box, text="整轨规格").grid(row=2, column=0, sticky="w", padx=4, pady=3)
+        self.var_spec = tk.StringVar()
+        self.cb_spec = ttk.Combobox(
+            mode_box, textvariable=self.var_spec, state="readonly", width=34,
+            values=list(SPEC_LABEL_TO_KEY))
+        self._set_spec_display()
+        self.cb_spec.grid(row=2, column=1, columnspan=3, sticky="w", padx=4, pady=3)
+
+        ttk.Label(mode_box, text="整轨命名").grid(row=3, column=0, sticky="w", padx=4, pady=3)
+        self.var_track_tpl = tk.StringVar(
+            value=self.cfg.get("track_name_template") or core.DEFAULT_TRACK_TEMPLATE)
+        self.entry_track_tpl = ttk.Entry(mode_box, textvariable=self.var_track_tpl, width=1)
+        self.entry_track_tpl.grid(row=3, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+
+        self.var_aaf = tk.BooleanVar(value=bool(self.cfg.get("export_aaf", False)))
+        self.var_aaf_mode = tk.StringVar(value=self.cfg.get("aaf_media_mode", "media"))
+        aaf_row = ttk.Frame(mode_box)
+        aaf_row.grid(row=4, column=0, columnspan=4, sticky="we", padx=4, pady=3)
+        self.chk_aaf = ttk.Checkbutton(
+            aaf_row, text="同时导出 AAF（交给 Pro Tools 混音）",
+            variable=self.var_aaf, command=self._sync_mode)
+        self.chk_aaf.pack(side="left")
+        ttk.Label(aaf_row, text="交付方式").pack(side="left", padx=(16, 4))
+        # S11：去掉写死 width=42（窗口一窄就撑出行），改随行弹性伸缩
+        self.cb_aaf = ttk.Combobox(
+            aaf_row, textvariable=self.var_aaf_mode, state="readonly",
+            values=list(AAF_LABEL_TO_KEY))
+        self._set_aaf_display()
+        self.cb_aaf.pack(side="left", fill="x", expand=True)
+
+        mode_box.columnconfigure(2, weight=1)
+
+        cfg_box = self.card(outer, "导出配置（片段模式）")
+
+        # 输出目录
+        self.var_output_dir = tk.StringVar(value=self.cfg.get("output_dir", ""))
+        self.path_row(cfg_box, 0, "输出目录（必填）", self.var_output_dir,
+                      lambda: self._pick_dir(self.var_output_dir),
+                      "按 类型/素材 自动分目录")
+        # 也可直接把文件夹拖到这个框里（v2.6.2 Q10）
+        self.entry_output_dir = cfg_box.grid_slaves(row=0, column=1)[0]
+
+        # 命名模板（多选：勾选多个 → 各生成一份输出）
+        ttk.Label(cfg_box, text="命名模板（可多选）").grid(row=1, column=0, sticky="nw", padx=4, pady=3)
+        nt_frame = ttk.Frame(cfg_box)
+        nt_frame.grid(row=1, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+        self._seed_templates()
+        self.lb_templates = tk.Listbox(nt_frame, height=4, selectmode="extended",
+                                       exportselection=0)
+        self.lb_templates.grid(row=0, column=0, columnspan=4, sticky="we", padx=(0, 4))
+        row_nt = ttk.Frame(nt_frame)
+        row_nt.grid(row=1, column=0, columnspan=4, sticky="we", pady=(3, 0))
+        self.var_new_tpl = tk.StringVar()
+        ttk.Entry(row_nt, textvariable=self.var_new_tpl).pack(
+            side="left", padx=(0, 4), fill="x", expand=True)
+        ttk.Button(row_nt, text="添加模板", command=self._add_template).pack(side="left", padx=2)
+        ttk.Button(row_nt, text="✗ 删除选中", command=self._remove_template,
+                   style="Danger.TButton").pack(side="left", padx=2)
+        # v2.7.0（J1）：模板可命名 —— 三栏管理弹窗（模板名/内容/样例）
+        ttk.Button(row_nt, text="管理…", command=self._manage_templates).pack(side="left", padx=2)
+        ttk.Label(nt_frame,
+                  text="Ctrl/Shift 多选；勾选的模板会各生成一份输出（多模板时按「模板N」分目录）",
+                  foreground="#888").grid(row=2, column=0, columnspan=4, sticky="w")
+        self._fill_templates()
+
+        # 格式 / 码率 / 重名 —— v2.6.6（J6）：旧版三组控件全挤在 row=2，
+        # 码率标签与格式下拉同列相贴，视觉上「码率框里出现了重名策略」。
+        # 拆成两行：格式+码率一行（各占独立列），重名策略独占下一行。
+        ttk.Label(cfg_box, text="音频格式（片段模式）").grid(
+            row=2, column=0, sticky="w", padx=4, pady=3)
+        # v2.6.6（J4）：出厂默认 mp3/192 → wav/320（用户工作流的期望默认）
+        self.var_format = tk.StringVar(value=self.cfg.get("audio_format", "wav"))
+        self.cb_format = ttk.Combobox(cfg_box, textvariable=self.var_format, values=("mp3", "wav"),
+                                      width=10, state="readonly")
+        self.cb_format.grid(row=2, column=1, sticky="w", padx=4)
+
+        ttk.Label(cfg_box, text="码率 kbps（仅 mp3）").grid(
+            row=2, column=2, sticky="e", padx=(24, 4))
+        self.var_bitrate = tk.StringVar(value=str(self.cfg.get("bitrate_kbps", 320)))
+        self.cb_bitrate = ttk.Combobox(cfg_box, textvariable=self.var_bitrate,
+                                       values=("128", "192", "256", "320"), width=8,
+                                       state="readonly")
+        self.cb_bitrate.grid(row=2, column=3, sticky="w", padx=4)
+        # wav 下码率不适用 → 格式变化时联动置灰（统一走 _sync_mode 出口）
+        self.var_format.trace_add("write", lambda *a: self._sync_mode())
+
+        ttk.Label(cfg_box, text="重名策略").grid(
+            row=3, column=0, sticky="w", padx=4, pady=3)
+        self.var_conflict = tk.StringVar()
+        # v2.6.2：旧版这里是纯英文的 rename/cover/skip
+        self.cb_conflict = ttk.Combobox(cfg_box, textvariable=self.var_conflict,
+                                        values=list(CONFLICT_LABEL_TO_KEY), width=16,
+                                        state="readonly")
+        self.cb_conflict.grid(row=3, column=1, sticky="w", padx=4)
+        self._set_conflict_display()
+
+        # v2.10.0（Q1）：素材类型下拉 —— {素材类型} 占位符的取值
+        ttk.Label(cfg_box, text="素材类型").grid(
+            row=3, column=2, sticky="e", padx=(18, 4))
+        self.var_clip_type = tk.StringVar()
+        # v2.12.0（S4）：放开为可编辑输入框 —— 用户填什么大写缩写就用什么，
+        # 不再限死下拉；留空或选「自动判定」= 按草稿素材类型自动映射。
+        self.cb_clip_type = ttk.Combobox(
+            cfg_box, textvariable=self.var_clip_type,
+            values=(CLIP_TYPE_AUTO_LABEL,) + CLIP_TYPE_VALUES, width=26,
+            state="normal")
+        self.cb_clip_type.grid(row=3, column=3, sticky="w", padx=4)
+        self._set_clip_type_display()
+
+        # 开关
+        self.var_dedupe = tk.BooleanVar(value=bool(self.cfg.get("dedupe", True)))
+        self.var_extract_video = tk.BooleanVar(
+            value=bool(self.cfg.get("extract_video_tracks", True)))
+        # v2.10.0（Q2）：断点续跑默认**不勾选** —— 旧默认 True 会把上一轮产物
+        # 当成「已完成」整批跳过，输出目录空空却显示成功，像工具坏了。
+        self.var_skip_existing = tk.BooleanVar(
+            value=bool(self.cfg.get("skip_existing", False)))
+        self.var_split_video = tk.BooleanVar(
+            value=bool(self.cfg.get("split_by_video", False)))
+        row = ttk.Frame(cfg_box)
+        row.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=3)
+        self.chk_dedupe = ttk.Checkbutton(row, text="按内容去重", variable=self.var_dedupe)
+        self.chk_dedupe.pack(side="left")
+        ttk.Checkbutton(row, text="提取视频内嵌音轨",
+                        variable=self.var_extract_video).pack(side="left", padx=16)
+        ttk.Checkbutton(row, text="断点续跑（跳过已处理草稿）",
+                        variable=self.var_skip_existing).pack(side="left", padx=16)
+        # v2.5.0：按视频片段分包（一个视频 = 一个交付文件夹）
+        # v2.10.0（Q4）：片段模式同样生效 —— 片段按视频窗归进对应「集」文件夹
+        self.chk_split = ttk.Checkbutton(
+            row, text="按视频分包（整轨/片段都按集归文件夹）",
+            variable=self.var_split_video)
+        self.chk_split.pack(side="left", padx=16)
+        # v2.7.0（J10b）：内容勾选 —— 字幕（文本轨 → .srt）
+        self.var_subtitles = tk.BooleanVar(
+            value=bool(self.cfg.get("export_subtitles", False)))
+        self.chk_subtitles = ttk.Checkbutton(
+            row, text="导出字幕（.srt，文本轨）",
+            variable=self.var_subtitles)
+        self.chk_subtitles.pack(side="left", padx=16)
+        # v2.7.0（J10a）：分包文件夹命名模板（默认 {视频名} 保持现状）
+        self.var_split_tpl = tk.StringVar(
+            value=self.cfg.get("split_folder_template", "{视频名}"))
+        ttk.Label(row, text="分包夹名:").pack(side="left", padx=(16, 2))
+        ttk.Entry(row, textvariable=self.var_split_tpl, width=16).pack(side="left")
+        ttk.Label(cfg_box,
+                  text="分包时可用新占位符：{视频项目} {集数} {编号} {AiFX} {视频名}；"
+                       "整轨命名另可用 {轨道类别}（MX/DX/FX 自动判定）；"
+                       "「素材类型」可手动指定 {素材类型} 的取值（DX对白 / FX音效 / BG环境 / MX音乐，"
+                       "默认按素材名自动判定，也可自由填写）；"
+                       "视频名是纯数字或项目名超过 4 字时会弹窗请您补项目名。",
+                  foreground="#888").grid(row=6, column=0, columnspan=4, sticky="w",
+                                          padx=4, pady=(0, 4))
+
+        # 备注
+        ttk.Label(cfg_box, text="备注文案").grid(row=5, column=0, sticky="w", padx=4, pady=3)
+        self.var_remarks = tk.StringVar(value=self.cfg.get("remarks", ""))
+        ttk.Entry(cfg_box, textvariable=self.var_remarks, width=1).grid(
+            row=5, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+        cfg_box.columnconfigure(1, weight=1)
+
+        # 按钮
+        btn_box = ttk.Frame(outer)
+        btn_box.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(btn_box, text="环境自检", command=self.run_check).pack(side="left", padx=4)
+        ttk.Button(btn_box, text="保存配置",
+                   command=lambda: self.save_config()).pack(side="left", padx=4)
+        ttk.Button(btn_box, text="打开输出目录",
+                   command=self.open_output_dir).pack(side="left", padx=4)
+        self.btn_run = ttk.Button(btn_box, text="▶ 开始导出", command=self.start_export,
+                                   style="Accent.TButton")
+        self.btn_run.pack(side="right", padx=4)
+
+        # 日志
+        self.make_log(outer, height=13,
+                      tip=("用法：① 填/选「输入源」（右侧会即时显示识别到几个草稿）"
+                           "‣ ② 填输出目录 ‣ ③ 点开始导出。\n"
+                           "本页功能完全独立，不需要 Pro Tools。\n"
+                           "· 目录可填**草稿根目录**（自动向下找草稿），也可填**单个草稿文件夹**。\n"
+                        "产物按类型分组（v3.9.0 起**分类在外、项目在内**）：\n"
+                        "  · 01-多条WAV/<草稿名|集名>/ —— 整轨模式（一条轨一个 WAV，等长对齐）\n"
+                        "  · 02-素材片段/<草稿名|集名>/ —— 片段模式（多模板再往下：模板1/模板2…）\n"
+                        "  · 03-AAF/<草稿名|集名>/ —— AAF（整轨一个 / 分包每集一个，可直接交 PT）\n"
+                           "日志与断点续跑记录在「默认路径设置」指定的日志/数据目录，不混在产物里。\n\n"))
+
+        self._sync_mode()
+
+    def _mode_set(self) -> set:
+        """当前勾选的导出模式集合（兼容旧配置的单字符串值）。"""
+        m = self.cfg.get("export_mode", ["tracks"])
+        if isinstance(m, str):
+            m = [m]
+        return set(m) & {"tracks", "clips"}
+
+    def collect(self):
+        """只写本页字段，绝不触碰导入页/交付页的配置。"""
+        self.cfg["input_dir"] = self.var_input_dir.get().strip()
+        self.cfg["output_dir"] = self.var_output_dir.get().strip()
+        sel_idx = list(self.lb_templates.curselection())
+        lib = self.cfg["name_templates"]
+        # v2.7.0（J1）：模板条目已 dict 化，active/兼容字段仍存**模板串**
+        active = [lib[i]["template"] for i in sel_idx if 0 <= i < len(lib)]
+        if not active:
+            active = [lib[0]["template"]] if lib else [core.DEFAULT_CLIPS_TEMPLATE]
+        self.cfg["name_templates_active"] = active
+        self.cfg["name_template"] = active[0]   # 兼容旧字段 / CLI
+        self.cfg["audio_format"] = self.var_format.get()
+        try:
+            self.cfg["bitrate_kbps"] = int(self.var_bitrate.get())
+        except ValueError:
+            self.cfg["bitrate_kbps"] = 320
+        self.cfg["conflict"] = self._read_conflict()
+        # v2.10.0（Q1）：{素材类型} 手动覆盖（空 = 自动判定）
+        self.cfg["clip_type_override"] = self._read_clip_type()
+        self.cfg["dedupe"] = bool(self.var_dedupe.get())
+        self.cfg["extract_video_tracks"] = bool(self.var_extract_video.get())
+        self.cfg["skip_existing"] = bool(self.var_skip_existing.get())
+        self.cfg["remarks"] = self.var_remarks.get().strip()
+        sel = []
+        if self.var_mode_tracks.get():
+            sel.append("tracks")
+        if self.var_mode_clips.get():
+            sel.append("clips")
+        self.cfg["export_mode"] = sel
+        self.cfg["track_name_template"] = self.var_track_tpl.get().strip() or core.DEFAULT_TRACK_TEMPLATE
+        self.cfg["track_spec"] = self._read_spec()
+        self.cfg["export_aaf"] = bool(self.var_aaf.get())
+        self.cfg["aaf_media_mode"] = self._read_aaf_mode()
+        # v2.10.0（Q4）：分包不再限整轨 —— 片段模式同样按视频窗归「集」文件夹
+        # （旧版强制 `and "tracks" in mset`，导致纯片段模式永远平铺、
+        #   一个工程多个集数没法分夹。分段/整轨的按集能力 main 里本来就有。）
+        self.cfg["split_by_video"] = bool(self.var_split_video.get())
+        self.cfg["split_folder_template"] = self.var_split_tpl.get().strip() or "{视频名}"
+        # v2.7.0（J10b）：字幕导出（内容勾选之一）
+        self.cfg["export_subtitles"] = bool(self.var_subtitles.get())
+
+    def apply_config(self):
+        """把 self.cfg 的值刷回控件（菜单「重新载入配置」「默认路径」后调用）。
+
+        只刷 collect 里读过的字段，顺序与 collect 对称。
+        """
+        c = self.cfg
+        self.var_input_dir.set(c.get("input_dir", ""))
+        self.var_output_dir.set(c.get("output_dir", ""))
+        # ⚠️ v2.6.3 真 bug 修复：旧版这里引用 self.var_template.set(...)，
+        #    但该控件在 v1.2.0 改多选 Listbox 时已被删除 —— 菜单点
+        #    「重新载入配置 / 默认路径设置」会直接 AttributeError 崩溃。
+        #    name_template 由 collect() 从勾选模板派生，此处无需也不应回填。
+        self.var_format.set(c.get("audio_format", "wav"))
+        self.var_bitrate.set(str(c.get("bitrate_kbps", 320)))
+        self._set_conflict_display()
+        self.var_dedupe.set(bool(c.get("dedupe", True)))
+        self.var_extract_video.set(bool(c.get("extract_video_tracks", True)))
+        self.var_skip_existing.set(bool(c.get("skip_existing", False)))
+        self.var_remarks.set(c.get("remarks", ""))
+        self._set_clip_type_display()
+        self._seed_templates()
+        self._fill_templates()
+        mraw = c.get("export_mode", ["tracks"])
+        mset = {mraw} if isinstance(mraw, str) else set(mraw)
+        self.var_mode_tracks.set("tracks" in mset)
+        self.var_mode_clips.set("clips" in mset)
+        self.var_track_tpl.set(c.get("track_name_template")
+                               or core.DEFAULT_TRACK_TEMPLATE)
+        self.var_aaf.set(bool(c.get("export_aaf", False)))
+        self._set_aaf_display()
+        self.var_split_video.set(bool(c.get("split_by_video", False)))
+        self.var_subtitles.set(bool(c.get("export_subtitles", False)))
+        self.var_split_tpl.set(c.get("split_folder_template", "{视频名}"))
+        self._set_spec_display()
+        self._set_aaf_display()
+        self._sync_mode()
+
+    # ───────────── 命名模板库（多选）─────────────
+
+    def _seed_templates(self):
+        """向后兼容 + 初始化模板库：旧配置只有单 ``name_template`` 时，补出
+        ``name_templates`` / ``name_templates_active``。
+
+        v2.7.0（J1）：模板条目升级为 ``{"name": 模板名, "template": 模板串}``——
+        旧版字符串条目自动迁移（名字 = 模板串前 12 字符）；
+        ``name_templates_active`` 仍存**模板串**（渲染逻辑与 CLI 兼容零改动）。
+        """
+        lib = self.cfg.get("name_templates")
+        if not lib:
+            presets = [normalize_template_entry(p) for p in core.NAMING_PRESETS]
+            legacy = self.cfg.get("name_template") or core.DEFAULT_CLIPS_TEMPLATE
+            if legacy and legacy not in [p["template"] for p in presets]:
+                presets.insert(0, normalize_template_entry(legacy))
+            self.cfg["name_templates"] = presets
+        else:
+            self.cfg["name_templates"] = [normalize_template_entry(e) for e in lib]
+        if not self.cfg.get("name_templates_active"):
+            legacy = self.cfg.get("name_template") or (
+                self.cfg["name_templates"][0]["template"] if self.cfg["name_templates"]
+                else core.DEFAULT_CLIPS_TEMPLATE)
+            tpls = [p["template"] for p in self.cfg["name_templates"]]
+            active = [legacy] if legacy in tpls else \
+                ([self.cfg["name_templates"][0]["template"]]
+                 if self.cfg["name_templates"] else [])
+            self.cfg["name_templates_active"] = active
+
+    def _fill_templates(self):
+        """把模板库渲染进 Listbox（「模板名 ｜ 内容」），并选中 active 项。"""
+        self.lb_templates.delete(0, "end")
+        for e in self.cfg["name_templates"]:
+            self.lb_templates.insert("end", "%s ｜ %s" % (e["name"], e["template"]))
+        # active 恒为模板串集合；脏数据（如 dict）防御性过滤
+        active = {x for x in self.cfg.get("name_templates_active", [])
+                  if isinstance(x, str)}
+        for i, e in enumerate(self.cfg["name_templates"]):
+            if e["template"] in active:
+                self.lb_templates.selection_set(i)
+
+    def _add_template(self):
+        new = self.var_new_tpl.get().strip()
+        if not new:
+            return
+        tpls = [e["template"] for e in self.cfg["name_templates"]]
+        if new not in tpls:
+            self.cfg["name_templates"].append(
+                {"name": new[:12] or "模板", "template": new})
+        if new not in self.cfg.get("name_templates_active", []):
+            self.cfg.setdefault("name_templates_active", []).append(new)
+        self.var_new_tpl.set("")
+        self._fill_templates()
+
+    def _remove_template(self):
+        idxs = list(self.lb_templates.curselection())
+        if not idxs:
+            return
+        for i in sorted(idxs, reverse=True):
+            if 0 <= i < len(self.cfg["name_templates"]):
+                removed = self.cfg["name_templates"].pop(i)["template"]
+                if removed in self.cfg.get("name_templates_active", []):
+                    self.cfg["name_templates_active"].remove(removed)
+        if not self.cfg["name_templates"]:
+            self.cfg["name_templates"] = [
+                {"name": "默认模板", "template": core.DEFAULT_CLIPS_TEMPLATE}]
+        if not self.cfg.get("name_templates_active"):
+            self.cfg["name_templates_active"] = [
+                self.cfg["name_templates"][0]["template"]]
+        self._fill_templates()
+
+    def _manage_templates(self):
+        """J1（v2.7.0）：命名模板管理弹窗 —— 「模板名 / 模板内容 / 样例」三栏。
+
+        勾选（哪些模板参与导出）仍在主窗口 Listbox 维护；这里只管库内容。
+        """
+        win = tk.Toplevel(self)
+        win.title("命名模板管理")
+        win.transient(self.winfo_toplevel())
+        win.geometry("760x430")
+        win.grab_set()
+        ttk.Label(win, text=("左侧选择模板 → 编辑名称与内容（样例实时预览）。"
+                             "勾选哪些模板参与导出，请在主窗口的模板列表里选。"),
+                  foreground="#888").pack(anchor="w", padx=10, pady=(8, 4))
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=10)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        lb = tk.Listbox(body, exportselection=0, width=30)
+        lb.grid(row=0, column=0, sticky="ns")
+
+        ttk.Label(body, text="模板名").grid(row=0, column=1, sticky="w")
+        var_name = tk.StringVar()
+        ttk.Entry(body, textvariable=var_name).grid(
+            row=1, column=1, sticky="we", padx=(8, 10))
+        ttk.Label(body, text="模板内容").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        txt = tk.Text(body, height=3)
+        txt.grid(row=3, column=1, sticky="we", padx=(8, 10))
+        ttk.Label(body, text="样例（{字段} 按示例值展开）").grid(
+            row=4, column=1, sticky="w", pady=(8, 0))
+        var_sample = tk.StringVar()
+        ttk.Label(body, textvariable=var_sample, foreground="#2a7",
+                  wraplength=520, justify="left").grid(row=5, column=1, sticky="w")
+
+        SAMPLES = {"{项目名}": "测试", "{集数}": "6", "{轨道类别}": "DX",
+                   "{序号:02d}": "01", "{序号:03d}": "001", "{素材类型}": "audio",
+                   "{原始名}": "AI配音_01", "{时长}s": "42.5s", "{编号}": "01",
+                   "{视频项目}": "测试", "{AiFX}": "AiFX", "{视频名}": "测试06",
+                   "{类型}": "audio"}
+        state = {"old": None}          # 当前编辑条目的旧模板串（active 同步用）
+
+        def refresh_sample(*_a):
+            s = txt.get("1.0", "end").strip()
+            for k, v in SAMPLES.items():
+                s = s.replace(k, v)
+            var_sample.set(s)
+
+        def reload_lb(keep=None):
+            lb.delete(0, "end")
+            for e in self.cfg["name_templates"]:
+                lb.insert("end", "%s ｜ %s" % (e["name"], e["template"]))
+            if keep is not None and 0 <= keep < lb.size():
+                lb.selection_set(keep)
+                load_sel()
+
+        def load_sel(*_a):
+            sel = lb.curselection()
+            if not sel:
+                return
+            e = self.cfg["name_templates"][sel[0]]
+            var_name.set(e["name"])
+            txt.delete("1.0", "end")
+            txt.insert("1.0", e["template"])
+            state["old"] = e["template"]
+            refresh_sample()
+
+        def save_cur():
+            sel = lb.curselection()
+            if not sel:
+                self.warn("未选择", "请先在左侧选择一个模板。", parent=win)
+                return
+            name = var_name.get().strip()
+            t = txt.get("1.0", "end").strip()
+            if not name or not t:
+                self.warn("内容缺失", "模板名与内容都不能为空。", parent=win)
+                return
+            i = sel[0]
+            self.cfg["name_templates"][i] = {"name": name, "template": t}
+            act = self.cfg.get("name_templates_active", [])
+            old = state["old"]
+            if old in act and old != t:
+                act[act.index(old)] = t
+            if self.cfg.get("name_template") == old:
+                self.cfg["name_template"] = t
+            state["old"] = t
+            self._fill_templates()
+            reload_lb(i)
+
+        def new_tpl():
+            e = {"name": "新模板", "template": core.DEFAULT_CLIPS_TEMPLATE}
+            self.cfg["name_templates"].append(e)
+            reload_lb(len(self.cfg["name_templates"]) - 1)
+
+        def del_tpl():
+            sel = lb.curselection()
+            if not sel:
+                self.warn("未选择", "请先在左侧选择要删除的模板。", parent=win)
+                return
+            if len(self.cfg["name_templates"]) <= 1:
+                self.warn("至少保留一个", "模板库至少要有一个模板。", parent=win)
+                return
+            i = sel[0]
+            removed = self.cfg["name_templates"].pop(i)["template"]
+            act = self.cfg.get("name_templates_active", [])
+            if removed in act:
+                act.remove(removed)
+            if self.cfg.get("name_template") == removed:
+                self.cfg["name_template"] = self.cfg["name_templates"][0]["template"]
+            self._fill_templates()
+            reload_lb(max(0, i - 1))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=10, pady=(6, 10))
+        ttk.Button(btns, text="保存当前", command=save_cur).pack(side="left")
+        ttk.Button(btns, text="新建", command=new_tpl).pack(side="left", padx=6)
+        ttk.Button(btns, text="删除", command=del_tpl,
+                   style="Danger.TButton").pack(side="left")
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+
+        reload_lb(0)
+        lb.bind("<<ListboxSelect>>", load_sel)
+        txt.bind("<KeyRelease>", refresh_sample)
+
+    # ───────────── 规格 / AAF 下拉的「值 ↔ 显示」转换 ─────────────
+
+    def _set_spec_display(self):
+        """配置 key → 下拉显示名（v2.6.2：显示名里不再混内部 key）。"""
+        key = self.cfg.get("track_spec", core.DEFAULT_SPEC_KEY)
+        if key not in core.SPEC_PRESETS:
+            key = core.DEFAULT_SPEC_KEY     # 脏数据只影响显示，写回前会报错
+        self.var_spec.set(core.SPEC_PRESETS[key][0])
+
+    def _read_spec(self) -> str:
+        """显示名 → key。
+
+        ⚠️ v2.6.2：认不出来**抛 ValueError，绝不静默回落**。旧实现是
+        `v.split()[0] if v else DEFAULT` —— 把框里的字删空、或手打了任意字，
+        都会无声无息变成默认规格，用户以为选了 44.1k/16bit，实际导出的是默认值。
+        """
+        label = (self.var_spec.get() or "").strip()
+        if label in SPEC_LABEL_TO_KEY:
+            return SPEC_LABEL_TO_KEY[label]
+        if label in core.SPEC_PRESETS:          # 兼容旧 config 里存的裸 key
+            return label
+        raise ValueError("「整轨规格」当前值是「%s」，不在可选项里 —— 请从下拉重新选一项"
+                         "（工具不会擅自替你猜一个）。" % (label or "（空）"))
+
+    def _set_aaf_display(self):
+        key = self.cfg.get("aaf_media_mode", "media")
+        self.var_aaf_mode.set(AAF_MODES.get(key, AAF_MODES["media"]))
+
+    def _read_aaf_mode(self) -> str:
+        label = (self.var_aaf_mode.get() or "").strip()
+        if label in AAF_LABEL_TO_KEY:
+            return AAF_LABEL_TO_KEY[label]
+        if label in AAF_MODES:
+            return label
+        raise ValueError("「交付方式」当前值是「%s」，不在可选项里 —— 请从下拉重新选一项。"
+                         % (label or "（空）"))
+
+    def _set_conflict_display(self):
+        key = self.cfg.get("conflict", "rename")
+        self.var_conflict.set(CONFLICT_MODES.get(key, CONFLICT_MODES["rename"]))
+
+    def _read_conflict(self) -> str:
+        label = (self.var_conflict.get() or "").strip()
+        if label in CONFLICT_LABEL_TO_KEY:
+            return CONFLICT_LABEL_TO_KEY[label]
+        if label in CONFLICT_MODES:
+            return label
+        raise ValueError("「重名策略」当前值是「%s」，不在可选项里 —— 请从下拉重新选一项。"
+                         % (label or "（空）"))
+
+    # ── v2.10.0（Q1）：素材类型「值 ↔ 显示」 ──
+
+    def _set_clip_type_display(self):
+        key = str(self.cfg.get("clip_type_override", "") or "").strip()
+        self.var_clip_type.set(key if key else CLIP_TYPE_AUTO_LABEL)
+
+    def _read_clip_type(self) -> str:
+        # v2.12.0（S4）：可自由填 UCS 码，填什么用什么；只有选「自动判定」或留空才回落自动。
+        label = (self.var_clip_type.get() or "").strip()
+        if not label or label == CLIP_TYPE_AUTO_LABEL:
+            return ""
+        return label
+
+    def _sync_mode(self):
+        """按勾选模式开关控件：整轨专属项（规格/整轨命名/AAF）仅在勾了整轨时可用；
+        片段专属项（格式/码率/去重）仅在勾了片段时可用。
+
+        门控思路与导入页一致 —— 不满足条件直接置灰，而不是等点了才报错。
+        """
+        mset = self._mode_set()
+        tracks = "tracks" in mset
+        clip = "clips" in mset
+        state = "normal" if tracks else "disabled"
+        # v2.10.0（Q4）：分包不再依赖整轨 —— 片段模式也按视频窗归「集」文件夹，
+        # 任一模式勾选即可用；两种都没勾时置灰（本来也导不出东西）
+        self.chk_split.configure(state="normal" if (tracks or clip) else "disabled")
+        # v2.6.5（J2）：AAF 只配整轨/分包模式（AAF 描述完整时间线；纯片段模式
+        # 只有素材块、无法生成时间线语义的 AAF）。置灰时把原因写进文案，
+        # 不再让用户对着灰色复选框猜「为什么不能用了」。
+        try:
+            self.chk_aaf.configure(
+                state=state,
+                text=("同时导出 AAF（交给 Pro Tools 混音）" if tracks else
+                      "同时导出 AAF —— 需先勾选「整轨」模式"
+                      "（AAF 描述完整时间线，纯片段模式无法生成）"))
+        except Exception:
+            pass
+        try:
+            self.entry_track_tpl.configure(state=state)
+        except Exception:
+            pass
+        # ⚠️ v2.6.2 真 bug 修复：下拉必须用 **readonly**，不能用 normal。
+        #    旧版这里写 `state = "normal" if tracks else "disabled"`，把建控件时
+        #    设的 readonly 覆盖掉 → 框里的字能删；删空后旧 `_read_spec()` 取首
+        #    token 查不到就静默回落默认值，用户完全不知情。
+        combo_state = "readonly" if tracks else "disabled"
+        try:
+            self.cb_spec.configure(state=combo_state)
+        except Exception:
+            pass
+        # AAF 交付方式只在勾了整轨且勾了 AAF 时可改
+        try:
+            self.cb_aaf.configure(state="readonly" if (tracks and self.var_aaf.get())
+                                  else "disabled")
+        except Exception:
+            pass
+        # 片段专属项（整轨固定 WAV，码率/去重无意义）
+        # v2.6.6（J4）：码率仅 mp3 有意义 —— wav 下也置灰，避免「WAV+320」的困惑
+        try:
+            self.cb_format.configure(state="readonly" if clip else "disabled")
+        except Exception:
+            pass
+        # v2.10.0（Q1）：素材类型是片段命名的字段 → 仅片段模式可改
+        try:
+            self.cb_clip_type.configure(state="normal" if clip else "disabled")
+        except Exception:
+            pass
+        try:
+            if not clip or self.var_format.get() == "wav":
+                self.cb_bitrate.configure(state="disabled")
+            else:
+                self.cb_bitrate.configure(state="readonly")
+        except Exception:
+            pass
+        try:
+            self.chk_dedupe.configure(state="normal" if clip else "disabled")
+        except Exception:
+            pass
+
+    # ───────────── 拖拽 ─────────────
+
+    def _pick_dir(self, var: tk.StringVar):
+        p = self.ask_dir(initial=var.get())
+        if p:
+            var.set(p)
+
+    def _pick_input_files(self):
+        from tkinter import filedialog
+        files = filedialog.askopenfilenames(
+            title="选择草稿 JSON 或音视频文件",
+            filetypes=[
+                ("全部支持", "*.json;*.jane;*.mp4;*.mov;*.mkv;*.avi;*.flv;*.webm;*.mp3;*.wav;*.flac;*.m4a;*.aac"),
+                ("剪映草稿", "*.json;*.jane"),
+                ("音视频", "*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.wav;*.flac;*.m4a;*.aac"),
+                ("所有文件", "*.*"),
+            ])
+        if files:
+            self._set_dropped([Path(f) for f in files])
+
+    def _browse_input_dir(self):
+        """浏览选目录 → 写入「剪映草稿目录」并**立刻反馈识别结果**。
+
+        v2.6.2（Q10）：旧版只 `var.set(p)` 就结束，没有任何反馈；而且因为
+        start_export 里 `if self.dropped_paths:` 恒优先，历史上拖过一次后
+        这里填什么目录都不生效。现在改成「**最后操作者优先**」—— 选目录即清空
+        拖拽列表，目录里的草稿立刻数给你看，不用等到点「开始导出」才发现。
+        """
+        p = self.ask_dir("选择剪映草稿根目录 / 草稿文件夹",
+                         initial=self.var_input_dir.get())
+        if not p:
+            return
+        self.var_input_dir.set(p)
+        self.dropped_paths = []
+        self._refresh_input_summary()
+
+    def _schedule_input_summary(self):
+        """手填路径时延迟刷新识别（避免每敲一个字都递归扫描）。"""
+        if getattr(self, "_sum_job", None):
+            try:
+                self.after_cancel(self._sum_job)
+            except Exception:
+                pass
+        try:
+            self._sum_job = self.after(600, self._refresh_input_summary)
+        except Exception:
+            pass
+
+    def _refresh_input_summary(self):
+        """即时识别「剪映草稿目录」里有几个草稿，并给出可读反馈。
+
+        v2.10.0（Q5）：扫描挪到**后台线程** —— 输入指向大目录时
+        resolve_input_paths 会 rglob 全树（几千个 stat），旧版在主线程做，
+        手填路径时每次敲键都可能卡住界面。结果经 after 轮询回主线程刷新。
+        """
+        if not getattr(self, "var_input_summary", None):
+            return
+        raw = self.var_input_dir.get().strip()
+        if not raw:
+            self.var_input_summary.set("未填写 —— 将自动定位剪映默认草稿目录")
+            return
+        root = Path(raw)
+        if not root.exists():
+            self.var_input_summary.set("⚠ 路径不存在：%s" % raw)
+            return
+        if getattr(self, "_scan_busy", False):
+            return                            # 上一轮还在扫，避免堆积
+        self._scan_busy = True
+        self.var_input_summary.set("… 识别中")
+        result = {}
+
+        def scan():
+            try:
+                result["drafts"] = core.resolve_input_paths([root])[0]
+            except Exception as e:
+                result["err"] = e
+
+        threading.Thread(target=scan, daemon=True).start()
+
+        def poll():
+            if "drafts" not in result and "err" not in result:
+                try:
+                    self.after(120, poll)
+                except Exception:
+                    pass
+                return
+            self._scan_busy = False
+            # 扫描期间路径又被改了 → 以最新值为准再刷一轮
+            if self.var_input_dir.get().strip() != raw:
+                self._schedule_input_summary()
+                return
+            if "err" in result:
+                self.var_input_summary.set("⚠ 识别失败：%s" % result["err"])
+                return
+            drafts = result["drafts"]
+            if drafts:
+                self.var_input_summary.set("✓ 已识别 %d 个剪映草稿" % len(drafts))
+                self.log("· 草稿目录识别：%d 个 —— %s\n" % (
+                    len(drafts), "、".join(d.name for d in drafts[:10])))
+            else:
+                self.var_input_summary.set("⚠ 该目录下没识别到剪映草稿"
+                                           "（可往上一级选草稿根目录）")
+
+        self.after(60, poll)
+
+    def _set_dropped(self, paths):
+        self.on_drop(list(paths))
+
+    def _clear_dropped(self):
+        self.dropped_paths = []
+        self.var_input_dir.set("")
+        self._refresh_input_summary()
+        self.log("· 已清空输入源\n")
+
+    def on_drop(self, paths):
+        """由主窗口的拖放处理器转发进来。"""
+        paths = [p for p in paths if p.exists()]
+        if not paths:
+            self.log("✗ 拖入的内容无法识别（路径不存在）\n")
+            return
+        self.dropped_paths = paths
+        try:
+            draft_dirs, _root, file_mode = core.resolve_input_paths(paths)
+        except Exception as e:
+            self.log(f"✗ 拖入内容解析失败: {e}\n")
+            return
+        names = "、".join(p.name for p in paths[:6])
+        if len(paths) > 6:
+            names += f" 等 {len(paths)} 项"
+
+        if draft_dirs:
+            self.var_input_summary.set(f"✓ 已识别 {len(draft_dirs)} 个剪映草稿")
+            self.log(f"✓ 拖入识别：{len(draft_dirs)} 个草稿 —— {names}\n")
+            for d in draft_dirs[:20]:
+                self.log(f"    · 草稿 {d.name}\n")
+        elif file_mode:
+            self.var_input_summary.set(f"未发现草稿，将按媒体文件整轨提取（来源：{names}）")
+            self.log(f"✓ 拖入识别：未发现草稿，按媒体文件处理 —— {names}\n")
+        else:
+            self.var_input_summary.set("拖入内容中未识别到草稿或音视频，请检查")
+            self.log(f"✗ 未识别到可导出的内容: {names}\n")
+
+        if len(paths) == 1 and paths[0].is_dir():
+            self.var_input_dir.set(str(paths[0]))
+
+    # ───────────── 动作 ─────────────
+
+    def open_output_dir(self):
+        path = self.var_output_dir.get().strip() or core.DEFAULT_CONFIG["output_dir"]
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.error("无法创建", f"输出目录创建失败：{e}")
+            return
+        self.open_in_explorer(path)
+
+    def run_check(self):
+        if self.running:
+            return
+        self.log("=" * 40 + "\n环境自检开始…\n" + "=" * 40 + "\n")
+
+        def job():
+            core.check_environment()
+            print("\n环境自检完成。ffmpeg / 剪映就绪即可开始导出。\n")
+
+        self.run_async(job)
+
+    def start_export(self):
+        if self.running:
+            return
+        try:
+            self.collect()
+        except ValueError as e:
+            # v2.6.2：界面取值不合法就**明确告知**，不再悄悄按默认值跑
+            self.warn("界面取值有误", str(e))
+            return
+
+        if not self._mode_set():
+            self.warn("未选择导出模式",
+                                   "请至少勾选一种导出模式（整轨 / 片段）。")
+            return
+
+        if not self.cfg.get("output_dir"):
+            self.warn("缺少输出目录", "请先填写「输出目录」，或点「浏览…」选择。")
+            return
+
+        self.save_config(quiet=True)
+        cfg = dict(self.cfg)
+
+        # ── v2.10.0（Q5）：两阶段异步导出，主线程全程零重活 ──
+        # 旧版在**主线程**里做两件重活，是「开始导出就死机」的根因
+        #（Windows 事件日志 2026-09-27 13:35:36 / 13:38:28 两次 AppHangB1
+        #  「Top level window is idle」实锤）：
+        #   ① resolve_input_paths —— 输入指向大目录时 rglob 全树（草稿目录里
+        #      Resources/ 等子树动辄几千个文件）；
+        #   ② _prepare_video_names —— 分包模式逐草稿解密（jy-draftc 子进程
+        #      单个最长 60s，剪映开着时 videoeditor.dll 争用更慢）。
+        # 现在：阶段1（后台）解析输入 + 视频名准备 → 阶段2（主线程）必要时
+        # 弹项目名补录框 → 阶段3（后台）真导出。界面始终可响应。
+        def phase1():
+            self.set_stage("解析输入路径")
+            self._phase1_msg = None
+            draft_dirs, media_files, root = [], [], None
+            if self.dropped_paths:
+                draft_dirs, root, file_mode = core.resolve_input_paths(self.dropped_paths)
+                if not draft_dirs and not media_files and not file_mode:
+                    self._phase1_msg = "拖入的内容里没有识别到剪映草稿或音视频文件。"
+                    return [], [], None
+                if file_mode:
+                    media_files = self._collect_media_files()
+            else:
+                root_str = self.cfg.get("input_dir", "").strip()
+                root = Path(root_str) if root_str else core.DEFAULT_JIANYING_DRAFT_ROOT
+                # 浏览按钮选中的目录也走递归草稿识别（与拖拽一致）
+                if root_str:
+                    found, _, _ = core.resolve_input_paths([root])
+                    if found:
+                        draft_dirs = found
+            if cfg.get("split_by_video"):
+                self._scan_video_names(root, draft_dirs)
+            self._export_drafts, self._export_media, self._export_root = \
+                draft_dirs, media_files, root
+            return draft_dirs, media_files, root
+
+        def phase1_done(err):
+            if err is not None:
+                return                      # 异常已由框架写进日志
+            msg = getattr(self, "_phase1_msg", None)
+            if msg:
+                self.warn("无法识别输入", msg)
+                return
+            # 主线程：分包缺项目名 → 弹窗补录（GUI 只能主线程碰）
+            if not self._confirm_video_names(cfg):
+                self.log("\n（已取消：分包模式的视频项目名没有补全）\n")
+                return
+
+            def job():
+                self.set_stage("执行导出（ffmpeg / AAF）")
+                stats = core.execute_export(cfg, self._export_root,
+                                            draft_dirs=self._export_drafts,
+                                            media_files=self._export_media)
+                print(f"\n✓ 导出完成：成功 {stats['success']} ｜ 失败 {stats['failed']} ｜ "
+                      f"跳过 {stats['skipped']}")
+
+            self.run_async(job, btn=self.btn_run, busy_text="导出中…")
+
+        self.run_async(phase1, on_done=phase1_done, btn=self.btn_run,
+                       busy_text="解析输入…")
+
+    def _scan_video_names(self, root, draft_dirs):
+        """（后台线程）分包前的视频名扫描 + 解析 —— 只算不问。
+
+        v2.10.0（Q5）自 _prepare_video_names 拆出：解密/解析是重活
+        （jy-draftc 单个最长 60s），必须在后台线程跑并逐草稿打进度；
+        缺项存进 ``self._pending_names``，真正弹窗问人由主线程的
+        ``_confirm_video_names`` 完成（GUI 控件只能在主线程碰）。
+        """
+        from core.videoname import parse_many, pending_map, suggest_project
+
+        self._pending_names = {}
+        self._pending_suggest = ""
+        names = []
+        dirs = list(draft_dirs or [])
+        if not dirs and root:
+            try:
+                dirs = core.scan_drafts(Path(root))
+            except Exception as e:
+                self.log(f"  [warn] 扫描草稿失败：{e}\n")
+        for i, d in enumerate(dirs, 1):
+            try:
+                self.set_stage("解析视频名 %d/%d" % (i, len(dirs)))
+                self.log(f"  · 解析视频名（{i}/{len(dirs)}）：{d.name}\n")
+                raw = core.resolve_draft_content_file(Path(d))
+                dec = core.decrypt_draft_file(raw)
+                for ch in core.parse_video_chunks(Path(d), dec):
+                    if ch.material_name:
+                        names.append(ch.material_name)
+            except Exception as e:
+                self.log(f"  [warn] 视频名解析失败（{Path(d).name}）：{e}\n")
+        if not names:
+            return
+
+        infos = core.apply_project(
+            parse_many(names), self.cfg.get("video_project_answers") or {})
+        self._pending_names = pending_map(infos)
+        self._pending_suggest = suggest_project(infos)
+
+    def _confirm_video_names(self, cfg) -> bool:
+        """（主线程）分包缺项补录弹窗；返回 False = 用户取消，中止导出。
+
+        答案存进 ``cfg["video_project_answers"]``（快照与共享配置各一份，
+        两者都要更新），下次不再问。
+        """
+        pend = getattr(self, "_pending_names", None)
+        if not pend:
+            return True
+        from .videoname_dialog import ask_video_projects
+
+        self.alert_line("弹出窗口「补充视频项目信息」，填完点确定才会继续导出。"
+                     "若没看到窗口，请检查另一块屏或按 Alt+Tab 找一下。")
+        got = ask_video_projects(self.winfo_toplevel(), list(pend.values()),
+                                 getattr(self, "_pending_suggest", ""))
+        if got is None:                      # 取消 → 中止，不带着缺项跑
+            return False
+        answers = dict(self.cfg.get("video_project_answers") or {})
+        answers.update({k: v for k, v in got.items() if v})
+        self.cfg["video_project_answers"] = answers
+        cfg["video_project_answers"] = answers
+        self.var_split_video.set(True)
+        return True
+
+    def _collect_media_files(self):
+        files = []
+        for p in self.dropped_paths:
+            if p.is_file() and core.media_kind(p):
+                files.append(p)
+            elif p.is_dir():
+                files.extend(f for f in p.rglob("*")
+                             if f.is_file() and core.media_kind(f))
+        return files
+
+    def on_show(self):
+        self._sync_mode()

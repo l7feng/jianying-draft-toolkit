@@ -1,0 +1,2026 @@
+#!/usr/bin/env python3
+"""
+剪映批量导出音频脚本 — 通用版
+扫描剪映草稿目录 → 解密草稿 JSON → 解析音频片段 → ffmpeg 切片转码 → 命名归档
+
+技术路线：jy-draftc 解密（调用剪映自身 videoeditor.dll）+ JSON 解析 + ffmpeg
+支持剪映 6.0+（加密草稿）与 5.x（明文草稿）自动识别
+
+用法：
+  python main.py --init          进入交互式初始化向导（配置输出目录等）
+  python main.py                 直接运行（使用现有配置；未初始化则先进入向导）
+  python main.py <草稿目录>      指定草稿目录运行
+  python main.py --check         环境自检（Python/ffmpeg/剪映/jy-draftc）
+"""
+
+import json
+import os
+import re
+import subprocess
+import hashlib
+import sys
+import shutil
+import logging
+from datetime import datetime
+from pathlib import Path
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple
+
+# ──────────────────── 配置 ────────────────────
+
+# ── 版本号（2026-09-21 增加：标题栏可见，用于识别 exe 新旧）──
+# 版本史：v1.0.0 基础导出 → v1.1.0 GUI+exe → v1.2.0 拖拽+整轨提取（09-17）
+#        → v2.0.0 整轨+AAF+三标签页合并（09-18）→ v2.1.0 L0/L1 分层（09-18）
+#        → v2.2.0 L0.5 黑窗+切页卡顿根治（09-19）
+#        → v2.3.0 菜单栏（文件/设置/工具/帮助）+ 默认路径设置对话框（09-21）
+#        → v2.4.0 导出模式多选 + 命名模板多选 + 整轨源文件相对路径解析修复（09-21）
+#        → v2.5.0 视频名提取字段（项目/集数/编号/AiFX）+ 按视频片段分包（09-23）
+#        → v2.5.1 片段模式也按视频窗归类（music/剧甲6/…，时间线落点归属）（09-23）
+#        → v2.6.0 产物目录分组（01-多条WAV/02-素材片段/03-AAF）+ 分包下按集导出 AAF
+#          + 日志/运行数据独立目录（log_dir/data_dir）+ {轨道类别} 占位符（09-23）
+#        → v3.9.0（仓库版本）产物目录**再翻转**：分类在外、项目在内
+#          （01-多条WAV/<草稿名|集名>/，而不是 <草稿名>/01-多条WAV/）——
+#          原话：「out 下面是常驻的根目录，项目打包要在里面」（09-27）
+#        → v2.6.1 文件夹结构反转（<草稿名|集名>/01-多条WAV/ 而非 01-多条WAV/<草稿名>/<集名>/）
+#          ⚠️ 该反转已被 v3.9.0 再次翻转，此行仅作历史留档
+#          + 素材片段去掉 audio/music 子目录 + render_name KeyError 循环移除未知字段后重新 format
+#          + 浏览按钮选中的目录走递归草稿识别（与拖拽一致）（09-23）
+#        → v2.6.3 出厂默认路径收口到 Backup-Jianying（out/log/data/tmp/deliver/草稿库）
+#          + 导出页两个输入源合并为一块（五.2）+ 导入页草稿下拉跟随配置的草稿库
+#          + 修 apply_config 引用已删控件 var_template 的崩溃（09-24）
+APP_VERSION = "3.14.0"
+
+
+def app_build_date() -> str:
+    """构建日期：frozen 取 exe 文件时间（打包时刻），源码模式取本文件时间。
+
+    目标：标题栏一眼识别新旧 —— 拿错旧版 exe 时日期会明显比固定资产旧。
+    """
+    try:
+        # ⚠️ sys.executable 是 str，必须先 Path() 包一层再 .stat()
+        # （曾写成 src.stat() 直接调用 → AttributeError 被 except 吞掉 →
+        #  标题栏恒显示「未知」，版本号功能等于半废）
+        src = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
+        return datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d")
+    except Exception:
+        return "未知"
+
+
+DEFAULT_JIANYING_DRAFT_ROOT = Path(os.environ.get(
+    "LOCALAPPDATA",
+    # 2026-09-28 脱敏：原兜底写死 `C:\Users\<某人>\AppData\Local`（换机器即失效）。
+    # 改成按当前用户主目录推导 —— 任何账号都对，且不再带个人用户名。
+    str(Path.home() / "AppData" / "Local")
+)) / "JianyingPro" / "User Data" / "Projects" / "com.lveditor.draft"
+
+# ── 应用基目录（PyInstaller 冻结感知）──────────────────
+# 源码模式：代码目录的父目录（包根，含 tools/）
+# frozen 模式（打包为 exe）：exe 所在目录（可写的真实目录，config.json / tools/ 都在此）
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+APP_DIR = _app_dir()
+SCRIPT_DIR = Path(__file__).resolve().parent  # 源码目录
+
+# ⚠️ 所有可变文件（配置 / 交付包）**一律写 APP_DIR**，不写代码目录。
+# 原因：打包成 exe 后代码在 _internal/ 内部（PyInstaller 临时目录，只读且会被清理）；
+# 即便源码模式，多标签页共用同一份 config.json 也需要一个稳定的落点。
+# 老用户的历史配置在 code/config.json，首次运行会由 config_path() 自动迁移过来。
+#
+# 配置相关（常量 / 默认值 / 读写 / 向导）已收敛到 core/config.py（L1 分层）。
+# APP_DIR 的 frozen 判定仍以本文件的 _app_dir() 为单一真相源，通过 set_app_dir 注入。
+from core import config as _cfg
+_cfg.set_app_dir(APP_DIR)
+
+# 兼容旧引用：原 main.py 内的模块级名字继续可用（CLI / GUI / tab 行为不变）
+from core.config import (              # noqa: E402
+    DEFAULT_CONFIG, DEFAULT_IMPORT_CONFIG, CONFIG_FIELDS,
+    CONFIG_PATH, LEGACY_CONFIG_PATH,
+    DEFAULT_TRACK_TEMPLATE, DEFAULT_SPEC_KEY,
+    DEFAULT_CLIPS_TEMPLATE, NAMING_PRESETS,
+    config_path, load_config, save_config, ask, parse_bool, init_config,
+    setup_logging,
+)
+
+# 视频名解析（v2.5.0）：从视频素材名提取 项目/集数/编号/AiFX
+from core.videoname import (          # noqa: E402
+    parse_video_name, parse_many, pending_map, apply_project, suggest_project,
+    VideoNameInfo, MAX_PROJECT_LEN, AIFX_PAT,
+)
+
+# jy-draftc 定位：优先包内 tools/，命中前先看 exe 旁（onedir 打包时 tools/ 在 exe 同级）
+def find_jy_draftc() -> Optional[Path]:
+    """定位 jy-draftc.exe。
+
+    候选顺序（先命中先用）：
+      1. APP_DIR/tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe   ← 标准布局
+      2. `tools/jy-draftc/jy-draftc.exe`                                 ← 解压时少一层目录
+      3. `tools/jy-draftc.exe`
+      4. `jy-draftc.exe`（与 exe 同级）
+    这样无论用户是「整个文件夹搬」还是「手动解压少了层目录」都能找到。
+    """
+    base = APP_DIR / "tools" / "jy-draftc"
+    cands = [
+        base / "jy-draftc-amd64-windows" / "jy-draftc.exe",
+        base / "jy-draftc.exe",
+        APP_DIR / "tools" / "jy-draftc.exe",
+        APP_DIR / "jy-draftc.exe",
+    ]
+    for c in cands:
+        if c.is_file():
+            return c
+    return cands[0]                  # 都没找到时返回标准路径（报错信息更有指向性）
+
+# 兼容旧引用（模块级常量在 import 时求值，进程内 tools/ 不会中途变化）
+JY_DRAFTC_EXE = find_jy_draftc()
+JY_DRAFTC_ENV = JY_DRAFTC_EXE.parent / ".env"
+
+
+# config_path() 已移至 core/config.py（见上方 import）
+
+# 素材类型 → 归档分类（music / voice / sfx / audio）
+TYPE_CATEGORY = {
+    "audio": "audio",                    # 通用音频
+    "voice": "voice",                    # 朗读/配音
+    "music": "music",                    # 音乐
+    "sfx": "sfx",                        # 音效
+    "video": "audio",                    # 视频内嵌音轨 → audio
+    "video_original_sound": "voice",     # 视频原声（分离到独立音轨的干声/人声）→ voice
+}
+
+# 素材类型 → 轨道类别标签（v2.6.0：命名模板 {轨道类别} 的取值）
+# v3.10.0（R-码表）：SFX 退役并入 FX —— 四桶口径 DX/FX/BG/MX（见 classify_clip_type）
+TYPE_CATEGORY_TRACK_LABEL = {
+    "music": "MX",
+    "voice": "DX",
+    "sfx": "FX",
+    "audio": "DX",
+    "video": "DX",
+    "video_original_sound": "DX",
+}
+
+# ── v3.10.0（R-码表）：{素材类型} 自动判定 —— 按素材**命名信息**归四桶 ──
+# DX=对白（台词/内心VO/画外音OS）  FX=音效（动效/拟音）  BG=环境（背景）  MX=音乐
+# 命中优先级 MX→BG→DX→FX：「BGM」同时含 BG 与 MX 词根，音乐更特异故先判。
+# 英文缩写按「词边界」匹配（前后不得是英文字母），避免 VOL（音量）误中 VO（画外音）；
+# 中文关键词按子串匹配。
+_CLIP_TYPE_WORDS = (
+    ("MX", ("mx", "mus", "music", "bgm", "score", "ost",
+            "配乐", "音乐", "音樂", "背景乐")),
+    ("BG", ("bg", "amb", "ambience", "atmos", "environment", "room", "wind",
+            "rain", "环境", "背景", "氛围", "風聲", "风声", "雨声")),
+    ("DX", ("dx", "dia", "dialog", "dialogue", "vo", "vox", "vocal", "adr",
+            "os", "对白", "台词", "旁白", "画外音", "独白", "内心", "配音",
+            "人声", "念白")),
+    ("FX", ("fx", "sfx", "eff", "fol", "foley", "hit", "impact", "whoosh",
+            "riser", "transition", "design", "音效", "动效", "拟音", "转场",
+            "打击")),
+)
+
+
+def _word_hit(word: str, s: str) -> bool:
+    """英文词按词边界（前后非英文字母）、中文词按子串，命中判据。"""
+    if not word.strip():
+        return False
+    if not word.isascii():
+        return word in s
+    start = s.find(word)
+    while start >= 0:
+        before = s[start - 1] if start > 0 else ""
+        after = s[start + len(word)] if start + len(word) < len(s) else ""
+        if not (before.isascii() and before.isalpha()) \
+                and not (after.isascii() and after.isalpha()):
+            return True
+        start = s.find(word, start + 1)
+    return False
+
+
+def classify_clip_type(name: str = "", track_type: str = "") -> str:
+    """按素材命名信息把 {素材类型} 归类为 DX/FX/BG/MX（R-码表 / v3.10.0）。
+
+    匹配：素材名小写后按 _CLIP_TYPE_WORDS 优先级找词根（UCS CatID 缩写 +
+    中英文关键词）；全不命中时按剪映素材内部类型回落（music→MX、voice→DX、
+    其余→FX）。
+    """
+    s = (name or "").lower()
+    for code, words in _CLIP_TYPE_WORDS:
+        if any(_word_hit(w, s) for w in words):
+            return code
+    return "MX" if track_type == "music" else "DX" if track_type == "voice" else "FX"
+
+# 文件名非法字符与长度限制
+ILLEGAL_CHARS = re.compile(r'[\\/:*?"<>|]')
+MAX_FILENAME_LEN = 180
+
+# 媒体文件扩展名（拖入文件 / 文件夹递归时识别）
+MEDIA_EXTS = {
+    ".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".rmvb",
+    ".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aiff", ".aif", ".ape",
+}
+# 剪映草稿标志文件（含其一即视为草稿文件夹）
+DRAFT_MARKERS = ("draft_content.json", "draft_info.json", "draft_meta_info.json")
+
+
+def find_jianying_install_dir() -> Optional[Path]:
+    """自动定位剪映安装目录（含 videoeditor.dll 的 Apps/<version>/ 目录）"""
+    base = Path(os.environ.get("LOCALAPPDATA", "")) / "JianyingPro" / "Apps"
+    if not base.exists():
+        return None
+    versions = sorted(base.iterdir(), reverse=True)  # 最新版本优先
+    for v in versions:
+        if (v / "videoeditor.dll").exists():
+            return v
+    return None
+
+
+# ──────────────────── Scanner ────────────────────
+
+def read_main_timeline_id(draft_dir: Path) -> Optional[str]:
+    """读取草稿的主时间线 ID。
+
+    剪映 6.x 草稿是「多时间线」结构，`Timelines/project.json` 是**明文** JSON，
+    其中的 `main_timeline_id` 指向剪映实际使用的那条时间线。
+    """
+    p = draft_dir / "Timelines" / "project.json"
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    tid = d.get("main_timeline_id")
+    if not tid:
+        # 回退：取 timelines 列表里第一条
+        tls = d.get("timelines") or []
+        if tls and isinstance(tls[0], dict):
+            tid = tls[0].get("id")
+    return tid or None
+
+
+def resolve_draft_content_file(draft_dir: Path) -> Path:
+    """定位草稿的「权威内容文件」——即剪映**实际读取**的那份 draft_content.json。
+
+    ⚠️ 背景（2026-09-17 实测踩坑）：剪映 6.x 草稿有两份 draft_content.json：
+      - `<草稿>/draft_content.json`                    —— 会话快照，剪映**不以此为准**
+      - `<草稿>/Timelines/<main_timeline_id>/draft_content.json` —— **权威源**
+
+    剪映 load/save 时会用时间线那份回写覆盖根目录那份。写入方若只写根目录文件，
+    剪映读不到任何改动（这正是「导入了但剪映里看不到」的根本原因）。
+    导出侧同理：只读根目录在「剪映未正常同步」场景下会拿到旧内容。
+
+    无 `Timelines/` 结构时（旧版草稿）回退根目录。
+    """
+    tid = read_main_timeline_id(draft_dir)
+    if tid:
+        p = draft_dir / "Timelines" / tid / "draft_content.json"
+        if p.is_file():
+            return p
+    return draft_dir / "draft_content.json"
+
+
+def scan_drafts(root: Path) -> List[Path]:
+    """扫描草稿根目录，返回草稿文件夹列表（已排除 Timelines/<uuid> 嵌套目录）"""
+    if not root.exists():
+        print(f"[scanner] 草稿目录不存在: {root}")
+        return []
+    drafts = [e for e in root.iterdir() if is_draft_dir(e)]
+    print(f"[scanner] 找到 {len(drafts)} 个草稿")
+    return sorted(drafts)
+
+
+_UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+def _looks_like_uuid(name: str) -> bool:
+    return bool(_UUID_RE.match(name))
+
+
+def _has_timeline_content(path: Path) -> bool:
+    """是否存在 `<草稿>/Timelines/*/draft_content.json`（剪映 6.x 的权威内容）。
+
+    v2.6.2（Q4 / Q10）：`is_draft_dir` 原先只认根目录三个 marker，而**本文件自己的**
+    `resolve_draft_content_file()` 白纸黑字写着权威内容在 `Timelines/<id>/` 下、
+    根目录那份只是会话快照甚至可能不存在 —— 于是"只有 Timelines 结构的草稿"会被
+    判成不是草稿。这是工具内部的逻辑自洽缺陷，补齐第二组 marker。
+    """
+    tl = path / "Timelines"
+    if not tl.is_dir():
+        return False
+    try:
+        for sub in tl.iterdir():
+            if sub.is_dir() and (sub / "draft_content.json").is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def is_draft_dir(path: Path) -> bool:
+    """目录是否为剪映草稿文件夹。
+
+    剪映草稿目录下还会嵌套 Timelines/<uuid>/ 子目录，里面同样有 draft_content.json，
+    但它们不是独立草稿（是同一草稿的多时间线备份），**必须排除**，否则会重复计数。
+    """
+    if not path.is_dir():
+        return False
+    if path.parent.name == "Timelines":          # 明确排除多时间线子目录
+        return False
+    # v2.6.2：根目录三 marker 命中，或存在 Timelines/<id>/draft_content.json，都算草稿
+    if not any((path / m).exists() for m in DRAFT_MARKERS) \
+            and not _has_timeline_content(path):
+        return False
+    if (path / "draft_meta_info.json").exists():
+        return True
+    # 兜底：目录名不形如 UUID 的才算草稿
+    return not _looks_like_uuid(path.name)
+
+
+def is_draft_json(path: Path) -> bool:
+    """文件是否为剪映草稿 JSON（加密的 draft_content.json / 解密产物 / .jane 工程）"""
+    if not path.is_file():
+        return False
+    if path.suffix.lower() == ".jane":
+        return True
+    return path.name in (
+        "draft_content.json", "draft_info.json",
+        "draft_content.json.dec.json", "draft_info.json.dec.json",
+    )
+
+
+def media_kind(path: Path) -> str:
+    """媒体文件类型：video / audio / ""（非媒体）"""
+    ext = path.suffix.lower()
+    if ext not in MEDIA_EXTS:
+        return ""
+    return "audio" if ext in {
+        ".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aiff", ".aif", ".ape",
+    } else "video"
+
+
+def resolve_input_paths(paths: List[Path]) -> Tuple[List[Path], Path, bool]:
+    """把「用户拖入的文件夹/文件混合列表」解析为可导出输入。
+
+    返回 (草稿目录列表, 草稿根, 是否纯文件模式)。
+
+    规则（智能识别）：
+    - 拖入文件夹：递归查找其中所有草稿文件夹（含 draft_content.json）；
+      若一个都没找到，则退回「递归找媒体文件」模式，把该文件夹下的音视频当作直接输入。
+    - 拖入文件：草稿 JSON / .jane → 其所在目录即一个草稿；音视频 → 作为直接输入文件。
+    """
+    draft_dirs: List[Path] = []
+    media_files: List[Path] = []
+    seen: set = set()
+
+    def add_draft(d: Path):
+        d = d.resolve()
+        if d not in seen:
+            seen.add(d)
+            draft_dirs.append(d)
+
+    def add_media(f: Path):
+        f = f.resolve()
+        if f not in seen:
+            seen.add(f)
+            media_files.append(f)
+
+    for p in paths:
+        p = Path(p)
+        if not p.exists():
+            print(f"[input] ✗ 路径不存在，已忽略: {p}")
+            continue
+
+        if p.is_dir():
+            if is_draft_dir(p):                       # 本身就指向一个草稿
+                add_draft(p)
+                continue
+            # 递归找草稿（草稿可嵌套在子目录）
+            found = [d for d in p.rglob("*") if is_draft_dir(d)]
+            if found:
+                for d in found:
+                    add_draft(d)
+            else:                                     # 无草稿 → 当普通媒体文件夹
+                print(f"[input] 目录内未发现剪映草稿，按媒体文件夹处理: {p}")
+                for f in p.rglob("*"):
+                    if f.is_file() and media_kind(f):
+                        add_media(f)
+
+        elif is_draft_json(p):                        # 拖入单个草稿 JSON
+            add_draft(p.parent)
+        elif media_kind(p):                           # 拖入音视频文件
+            add_media(p)
+        else:
+            print(f"[input] ⏭ 不支持的文件类型，已忽略: {p.name}")
+
+    if draft_dirs:
+        # 用公共父目录作为「草稿根」（仅用于日志展示）
+        try:
+            common = Path(os.path.commonpath([str(d) for d in draft_dirs]))
+        except ValueError:
+            common = draft_dirs[0]
+        for d in draft_dirs:
+            print(f"[input] 草稿: {d}")
+        for f in media_files:
+            print(f"[input] 媒体文件: {f}")
+        return draft_dirs, common, False
+
+    if media_files:
+        print(f"[input] 未识别到草稿，直接处理 {len(media_files)} 个媒体文件")
+        return [], Path("."), True
+
+    print("[input] ✗ 未识别到任何可导出的草稿或媒体文件")
+    return [], Path("."), False
+
+
+# ──────────────────── Decrypter ────────────────────
+
+def is_encrypted_json(path: Path) -> bool:
+    """判断 JSON 文件是否为加密格式（不以 { 开头）"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        return head[0:1] != b"{"
+    except Exception:
+        return False
+
+
+def find_videoeditor_dll() -> Optional[Path]:
+    """定位 videoeditor.dll 文件路径"""
+    install_dir = find_jianying_install_dir()
+    if install_dir is None:
+        return None
+    return install_dir / "videoeditor.dll"
+
+
+def ensure_jy_draftc_env():
+    """确保 jy-draftc 的 .env 文件配置了 JY_INSTALL_DIR"""
+    install_dir = find_jianying_install_dir()
+    if install_dir is None:
+        raise RuntimeError("未找到剪映安装目录（videoeditor.dll），请确认剪映已安装")
+    env_content = f"JY_INSTALL_DIR={install_dir}"
+    JY_DRAFTC_ENV.write_text(env_content, encoding="utf-8")
+    print(f"[decrypter] 配置 videoeditor.dll 路径: {install_dir}")
+    return install_dir
+
+
+def decrypt_draft_file(draft_file: Path) -> Path:
+    """调用 jy-draftc 解密单个草稿 JSON 文件，返回解密后的文件路径"""
+    if not is_encrypted_json(draft_file):
+        # 已是明文 JSON，直接返回原文件
+        return draft_file
+
+    if not JY_DRAFTC_EXE.exists():
+        raise RuntimeError(f"jy-draftc 未找到: {JY_DRAFTC_EXE}")
+
+    ensure_jy_draftc_env()
+
+    output = draft_file.parent / f"{draft_file.name}.dec.json"
+    # S2.4：解密产物已存在且不比源旧 → 跳过子进程（避免每集重解密 + 重写 .env）
+    if output.exists() and output.stat().st_mtime >= draft_file.stat().st_mtime:
+        return output
+
+    result = subprocess.run(
+        [str(JY_DRAFTC_EXE), "-d", str(draft_file)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60, **subprocess_kwargs(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"jy-draftc 解密失败: {result.stderr}")
+
+    output = draft_file.parent / f"{draft_file.name}.dec.json"
+    if not output.exists():
+        raise RuntimeError(f"解密输出文件不存在: {output}")
+    return output
+
+
+# ──────────────────── Parser ────────────────────
+
+@dataclass
+class AudioSegment:
+    """音频片段信息"""
+    project: str           # 草稿名称
+    track_type: str        # audio / voice / video（内嵌音轨）
+    source_path: str       # 源文件本地路径
+    start_us: int          # 起始时间（微秒）
+    end_us: int            # 结束时间（微秒）
+    material_name: str     # 素材文件名
+    material_id: str       # 素材 ID
+    tl_start_us: int = 0   # v2.5.1：时间线落点（target_timerange.start），用于按视频窗归属
+
+    @property
+    def duration_s(self) -> float:
+        return (self.end_us - self.start_us) / 1_000_000
+
+
+def parse_draft_json(draft_dir: Path, json_path: Path, extract_video_tracks: bool = True) -> List[AudioSegment]:
+    """解析解密后的 draft_content.json，提取音频片段清单"""
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    project_name = draft_dir.name
+    segments: List[AudioSegment] = []
+
+    # 构建素材 ID → 素材信息 映射
+    materials_map = {}
+    for category in ("videos", "audios", "texts"):
+        for mat in data.get("materials", {}).get(category, []):
+            materials_map[mat["id"]] = mat
+
+    # 遍历所有轨道
+    for track in data.get("tracks", []):
+        track_type = track.get("type", "")
+
+        # 音频轨道：直接是音频
+        if track_type in ("audio",):
+            for seg in track.get("segments", []):
+                mat_id = seg.get("material_id", "")
+                mat = materials_map.get(mat_id, {})
+                raw_path = mat.get("path", "")
+                resolved = resolve_source_path(raw_path, draft_dir)
+                source_path = str(resolved) if resolved else raw_path
+                mat_name = mat.get("material_name", Path(source_path).stem if source_path else "")
+                # 用 source_timerange（素材原始时间码）切片，target 为时间线位置
+                time_range = seg.get("source_timerange", seg.get("target_timerange", {}))
+                start = time_range.get("start", 0)
+                end = start + time_range.get("duration", 0)
+                tl_start = (seg.get("target_timerange") or {}).get("start", 0) or 0
+                segments.append(AudioSegment(
+                    project=project_name,
+                    track_type=mat.get("type", "audio"),
+                    source_path=source_path,
+                    start_us=start,
+                    end_us=end,
+                    material_name=mat_name,
+                    material_id=mat_id,
+                    tl_start_us=tl_start,
+                ))
+
+        # 视频轨道：从视频中提取内嵌音轨（方案扩展场景）
+        elif track_type == "video" and extract_video_tracks:
+            for seg in track.get("segments", []):
+                mat_id = seg.get("material_id", "")
+                mat = materials_map.get(mat_id, {})
+                raw_path = mat.get("path", "")
+                resolved = resolve_source_path(raw_path, draft_dir)
+                source_path = str(resolved) if resolved else raw_path
+                if not source_path:
+                    continue
+                mat_name = mat.get("material_name", Path(source_path).stem if source_path else "")
+                # 用 source_timerange（素材原始时间码）切片，target 为时间线位置
+                time_range = seg.get("source_timerange", seg.get("target_timerange", {}))
+                start = time_range.get("start", 0)
+                end = start + time_range.get("duration", 0)
+                tl_start = (seg.get("target_timerange") or {}).get("start", 0) or 0
+                segments.append(AudioSegment(
+                    project=project_name,
+                    track_type="video",  # 标记为视频内嵌音轨
+                    source_path=source_path,
+                    start_us=start,
+                    end_us=end,
+                    material_name=mat_name,
+                    material_id=mat_id,
+                    tl_start_us=tl_start,
+                ))
+
+    # 音轨段优先于视频内嵌音轨（去重覆盖判定依赖注册顺序）
+    segments.sort(key=lambda s: 1 if s.track_type == "video" else 0)
+
+    return segments
+
+
+# ──────────────────── 整轨（Track）模型 ────────────────────
+# 为什么需要整轨：片段模式把每段音频单独导出（4s、5s…一堆短文件），
+# 导入 PT 后全部堆在 0s，要手动摆位 N 次。整轨模式一条轨只出一个文件，
+# 长度 = 视频长度，空白补真静音 → 所有轨天然对齐，拖进 PT 即可用。
+
+#: 整轨输出规格预设：key → (界面标签, 采样率, 位深, 声道)，None = 跟随素材
+SPEC_PRESETS = {
+    "keep":       ("保持素材原始规格",  None,   None, None),
+    "48k24b_st":  ("48k/24bit 立体声", 48000,    24,    2),
+    "48k24b_mo":  ("48k/24bit 单声道", 48000,    24,    1),
+    "44k16b_st":  ("44.1k/16bit 立体声", 44100,  16,    2),
+    "48k16b_st":  ("48k/16bit 立体声", 48000,    16,    2),
+}
+# DEFAULT_SPEC_KEY 已移至 core/config.py（见顶部 import）
+
+#: 位深 → WAV PCM 编码器
+PCM_CODEC = {16: "pcm_s16le", 24: "pcm_s24le", 32: "pcm_s32le"}
+
+# DEFAULT_TRACK_TEMPLATE 已移至 core/config.py（见顶部 import）
+
+
+@dataclass
+class TrackSegment:
+    """整轨视角的片段：**同时**保留取材区间与时间线落点。
+
+    | 字段 | 来自 | 含义 |
+    |---|---|---|
+    | `src_start_us` / `src_dur_us` | `source_timerange` | 从源文件第几微秒取、取多长 |
+    | `tl_start_us` / `tl_dur_us`   | `target_timerange` | 落在时间线第几微秒、占多长 |
+
+    片段模式只读了前者、丢了后者 —— 这就是「位置信息丢失」的根因。
+    """
+    source_path: str
+    material_name: str
+    material_id: str
+    src_start_us: int = 0
+    src_dur_us: int = 0
+    tl_start_us: int = 0
+    tl_dur_us: int = 0
+    mat_type: str = ""                     # v2.6.0：素材类型（music/voice/sfx/audio…）
+
+
+@dataclass
+class AudioTrack:
+    """一条剪映轨道（audio，或开启后的 video 内嵌音轨）"""
+    project: str
+    name: str
+    index: int
+    source_kind: str                       # audio / video
+    segments: List[TrackSegment]
+
+    @property
+    def display_name(self) -> str:
+        """轨道名（剪映里叫什么就叫什么；无名时退化 Track N）"""
+        return self.name or f"Track {self.index}"
+
+    @property
+    def category(self) -> str:
+        """轨道类别（v2.6.0）：供命名模板 {轨道类别} 使用。
+
+        判定优先级：
+          1. 轨内任一素材名带 AiFX 标记 → `AiFX`（人工标注最可信）；
+          2. 轨内主导素材类型（时长加权）映射：music→MX、voice→DX、
+             sfx→SFX、其余（audio/video）→ DX。
+        """
+        for s in self.segments:
+            if AIFX_PAT.search(s.material_name or ""):
+                return "AiFX"
+        weight: dict = {}
+        for s in self.segments:
+            weight[s.mat_type or "audio"] = weight.get(s.mat_type or "audio", 0) + s.tl_dur_us
+        if not weight:
+            return "DX"
+        dominant = max(weight.items(), key=lambda kv: kv[1])[0]
+        return TYPE_CATEGORY_TRACK_LABEL.get(dominant, "DX")
+
+    @property
+    def end_us(self) -> int:
+        return max((s.tl_start_us + s.tl_dur_us) for s in self.segments) if self.segments else 0
+
+
+def _range_us(tr) -> Tuple[int, int]:
+    """从 timerange dict 取 (start, duration)，单位微秒；缺字段退化 0"""
+    if not isinstance(tr, dict):
+        return 0, 0
+    return int(tr.get("start", 0) or 0), int(tr.get("duration", 0) or 0)
+
+
+def parse_draft_tracks(draft_dir: Path, json_path: Path,
+                       extract_video_tracks: bool = True) -> Tuple[List[AudioTrack], int]:
+    """把草稿解析为「轨道视图」。
+
+    返回 (轨道列表, 时间线总长微秒)。与 `parse_draft_json` 的差别就是
+    **读取 target_timerange**，位置信息得以保留。
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    project_name = draft_dir.name
+    materials_map = {}
+    for category in ("videos", "audios", "texts"):
+        for mat in data.get("materials", {}).get(category, []):
+            materials_map[mat["id"]] = mat
+
+    tracks: List[AudioTrack] = []
+    idx = 0
+    for track in data.get("tracks", []):
+        ttype = track.get("type", "")
+        if ttype == "audio":
+            kind = "audio"
+        elif ttype == "video" and extract_video_tracks:
+            kind = "video"
+        else:
+            continue
+
+        idx += 1
+        segs: List[TrackSegment] = []
+        for seg in track.get("segments", []) or []:
+            mat = materials_map.get(seg.get("material_id", ""), {})
+            raw_path = mat.get("path", "")
+            resolved = resolve_source_path(raw_path, draft_dir)
+            src_path = str(resolved) if resolved else raw_path
+            if not src_path:
+                continue
+            s_start, s_dur = _range_us(seg.get("source_timerange"))
+            t_start, t_dur = _range_us(seg.get("target_timerange"))
+            if t_dur <= 0:
+                t_dur = s_dur                    # 无落点信息时退化为取材长度
+            if s_dur <= 0:
+                s_dur = t_dur
+            segs.append(TrackSegment(
+                source_path=src_path,
+                material_name=mat.get("material_name") or Path(src_path).stem,
+                material_id=seg.get("material_id", ""),
+                src_start_us=s_start,
+                src_dur_us=s_dur,
+                tl_start_us=t_start,
+                tl_dur_us=t_dur,
+                mat_type=mat.get("type", "audio"),   # v2.6.0：轨道类别判定用
+            ))
+        if not segs:
+            continue
+        segs.sort(key=lambda s: s.tl_start_us)
+        tracks.append(AudioTrack(
+            project=project_name,
+            name=(track.get("name") or "").strip(),
+            index=idx,
+            source_kind=kind,
+            segments=segs,
+        ))
+
+    return tracks, resolve_timeline_length_us(data, tracks)
+
+
+def _us_to_srt(us: int) -> str:
+    """微秒 → SRT 时码 ``HH:MM:SS,mmm``。"""
+    ms = max(0, int(us)) // 1000
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+
+
+def export_subtitles(json_path: Path, out_file: Path,
+                     win: tuple = None, data: dict = None) -> int:
+    """v2.7.0（J10b）：从草稿文本轨导出字幕 .srt（内容勾选之一，不依赖 ffmpeg）。
+
+    数据：``materials.texts``（id → content）+ ``tracks[type=text]`` 的
+    ``target_timerange``（时间线位置，微秒）。``win=(start_us, end_us)`` 时
+    只保留窗口内的字幕，并把时间码平移到窗口起点（分包按集对齐用）。
+    返回写入的字幕条数。
+    """
+    if data is None:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    texts_map = {m.get("id"): (m.get("content") or "")
+                 for m in data.get("materials", {}).get("texts", [])}
+    cues = []
+    for track in data.get("tracks", []):
+        if track.get("type") != "text":
+            continue
+        for seg in track.get("segments", []) or []:
+            t_start, t_dur = _range_us(seg.get("target_timerange"))
+            if t_dur <= 0:
+                continue
+            content = texts_map.get(seg.get("material_id", ""), "").strip()
+            if not content:
+                continue
+            cues.append((t_start, t_start + t_dur, content))
+    if win is not None:
+        ws, we = win
+        shifted = []
+        for s, e, c in sorted(cues):
+            if e <= ws or s >= we:
+                continue
+            shifted.append((max(0, s - ws), min(we, e) - ws, c))
+        cues = shifted
+    cues.sort(key=lambda x: (x[0], x[1]))
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        for i, (s, e, c) in enumerate(cues, start=1):
+            f.write("%d\n%s --> %s\n%s\n\n" % (i, _us_to_srt(s), _us_to_srt(e), c))
+    return len(cues)
+
+
+def resolve_timeline_length_us(data: dict, tracks: List[AudioTrack]) -> int:
+    """时间线总长（微秒）—— **跟随视频轨**最后一个片段的结束点。
+
+    基准为什么是视频轨：整轨的意义是「所有轨等长、天然对齐」，
+    决定成片长度的永远是画面。无视频轨时退化用音频轨最远结束点，
+    再退化用草稿 `duration` 字段。
+    """
+    video_end = audio_end = 0
+    for t in tracks:
+        end = t.end_us
+        if t.source_kind == "video":
+            video_end = max(video_end, end)
+        else:
+            audio_end = max(audio_end, end)
+    if video_end > 0:
+        return video_end
+    if audio_end > 0:
+        return audio_end
+    return int(data.get("duration", 0) or 0)
+
+
+# ──────────────────── 视频片段（分包单位）────────────────────
+
+@dataclass
+class VideoChunk:
+    """视频轨上的一个片段 —— 一「集」（或一段）的分包单位。
+
+    场景：一个草稿里放了 `剧甲2`、`剧甲3` 两个视频，音频轨是连续的三条。
+    按 chunk 切分后，每条音频轨在每个 chunk 区间内各出一份，
+    分别装进 `剧甲2/`、`剧甲3/` —— 交付时一集一个文件夹，不用再手工挑。
+    """
+    material_name: str
+    source_path: str
+    tl_start_us: int = 0
+    tl_dur_us: int = 0
+    index: int = 0
+
+    @property
+    def tl_end_us(self) -> int:
+        return self.tl_start_us + self.tl_dur_us
+
+    @property
+    def duration_s(self) -> float:
+        return self.tl_dur_us / 1e6
+
+
+def parse_video_chunks(draft_dir: Path, json_path: Path) -> List[VideoChunk]:
+    """取视频轨上的片段（按时间线落点排序）。
+
+    只取 `type == "video"` 的轨道 —— 决定"集"的永远是画面。
+    返回空列表 = 该草稿没有视频轨，调用方应退回整轨模式（不分包）。
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    materials_map = {}
+    for mat in data.get("materials", {}).get("videos", []):
+        materials_map[mat["id"]] = mat
+
+    chunks: List[VideoChunk] = []
+    for track in data.get("tracks", []):
+        if track.get("type") != "video":
+            continue
+        for seg in track.get("segments", []) or []:
+            mat = materials_map.get(seg.get("material_id", ""), {})
+            t_start, t_dur = _range_us(seg.get("target_timerange"))
+            if t_dur <= 0:
+                _, s_dur = _range_us(seg.get("source_timerange"))
+                t_dur = s_dur
+            if t_dur <= 0:
+                continue
+            raw_path = mat.get("path", "")
+            resolved = resolve_source_path(raw_path, draft_dir)
+            chunks.append(VideoChunk(
+                material_name=mat.get("material_name") or Path(raw_path).stem or "",
+                source_path=str(resolved) if resolved else raw_path,
+                tl_start_us=t_start,
+                tl_dur_us=t_dur,
+                index=len(chunks),
+            ))
+    chunks.sort(key=lambda c: c.tl_start_us)
+    for i, c in enumerate(chunks):
+        c.index = i
+    return chunks
+
+
+def chunk_video_infos(chunks: List[VideoChunk],
+                      answers: Optional[dict] = None) -> List[VideoNameInfo]:
+    """把视频片段名解析成字段；人类补过的项目名从 `answers` 回填。
+
+    `answers` = {原始视频名: 项目名}，来自 GUI 弹窗（存在 config 里，下次自动用）。
+    """
+    infos = parse_many([c.material_name for c in chunks])
+    if answers:
+        infos = apply_project(infos, answers)
+    return infos
+
+
+def probe_audio_spec(path: Path) -> Tuple[int, int, int]:
+    """ffprobe 读音频流规格 → (采样率, 声道数, 位深)；失败退回 (48000, 2, 16)"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=sample_rate,channels,bits_per_raw_sample",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **subprocess_kwargs(),)
+        if r.returncode == 0 and r.stdout.strip():
+            line = r.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            sr = int(float(parts[0])) if parts and parts[0] else 48000
+            ch = int(parts[1]) if len(parts) > 1 and parts[1] else 2
+            bits = int(parts[2]) if len(parts) > 2 and parts[2] else 16
+            return sr, max(ch, 1), bits
+    except Exception:
+        pass
+    return 48000, 2, 16
+
+
+def resolve_spec(spec_key: str, segments: List[TrackSegment]) -> Tuple[int, int, int]:
+    """把规格预设解析为具体 (采样率, 位深, 声道)；`keep` 取首个可用素材的规格。"""
+    label, sr, bits, ch = SPEC_PRESETS.get(spec_key, SPEC_PRESETS[DEFAULT_SPEC_KEY])
+    base_sr, base_ch, base_bits = 48000, 2, 16
+    for s in segments:
+        p = Path(s.source_path)
+        if p.exists():
+            base_sr, base_ch, base_bits = probe_audio_spec(p)
+            break
+    return (sr or base_sr), (bits or base_bits), (ch or base_ch)
+
+
+def render_track_name(template: str, project: str, track_name: str,
+                      index: int, duration_s: float, remarks: str = "",
+                      extra: Optional[dict] = None,
+                      category: str = "") -> str:
+    """整轨命名：额外提供 {轨道名} 字段（片段模式没有这个概念）
+
+    v2.5.0：`extra` 可注入视频名解析出的字段 ——
+    `{视频项目}` `{集数}` `{编号}` `{AiFX}` `{视频名}`（见 core/videoname.py）。
+    分包模式下默认由调用方传入；未分包时为 None，模板里写了这些占位符会被忽略。
+
+    v2.6.0：新增 `{轨道类别}` —— MX/DX/SFX/AiFX（见 AudioTrack.category）。
+    """
+    import datetime
+    fields = {
+        "项目名": project,
+        "轨道名": track_name,
+        "轨道类别": category,
+        "序号": index,
+        "日期": datetime.date.today().strftime("%Y%m%d"),
+        "时长": int(duration_s),
+        "备注": remarks,
+    }
+    if extra:
+        fields.update(extra)
+    try:
+        return sanitize_filename(template.format(**fields))
+    except KeyError:
+        # 移除所有未知字段后重新 format（此前只移除一个就返回，导致其余占位符残留）
+        import re as _re
+        known = set(fields.keys())
+        cleaned = _re.sub(
+            r"\{(\w+)(?::[^}]*)?\}",
+            lambda m: m.group(0) if m.group(1) in known else "",
+            template,
+        )
+        return sanitize_filename(cleaned.format(**fields))
+
+
+def write_silence_wav(output_file: Path, total_s: float, sr: int, bits: int,
+                      ch: int, log=print) -> bool:
+    """生成一段全静音 WAV（分包时补齐"这条轨在这段视频里没内容"的缺口）。
+
+    为什么必须补：同一集文件夹里的各条轨要**等长对齐**，缺一条就会在 DAW 里错位。
+    """
+    if total_s <= 0:
+        return False
+    layout = "stereo" if ch >= 2 else "mono"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", f"anullsrc=r={sr}:cl={layout}",
+           "-t", f"{total_s:.6f}",
+           "-ar", str(sr), "-ac", str(ch),
+           "-c:a", PCM_CODEC.get(bits, "pcm_s16le"), str(output_file)]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600,
+                       **subprocess_kwargs())
+    if r.returncode != 0:
+        log(f"  ✗ ffmpeg 静音失败: {(r.stderr or '').strip()[-300:]}")
+        return False
+    return True
+
+
+def extract_track_audio(track: AudioTrack, total_us: int, output_file: Path,
+                        spec_key: str = DEFAULT_SPEC_KEY, log=print,
+                        draft_dir: Optional[Path] = None,
+                        win_start_us: Optional[int] = None,
+                        win_end_us: Optional[int] = None) -> bool:
+    """把一条轨道渲染成**整轨 WAV**：片段按时间线落点摆放，空白补真静音。
+
+    ffmpeg 一次调用成型（无中间文件）：
+        每段 → atrim(取材区间) → asetpts → aformat → adelay(落点) → apad → atrim(总长)
+        多段 → amix(normalize=0) 求和（同一轨的片段本就不重叠，求和等价拼接）
+    空白段是**全零采样**（volumedetect ≈ -91dB 数字静音），不是"没有音频"。
+
+    v2.5.0：`win_start_us/win_end_us` 指定后只渲染**该时间窗**（按视频分包用）。
+    实现上把每条片段裁到与窗口的重叠部分、落点减去窗起点 ——
+    窗外的部分根本不进 ffmpeg，长视频不会白算。
+
+    源文件解析：素材 path 多数相对草稿根，但工具以 exe 目录为 CWD，按原样判断会
+    误报缺失。先 `resolve_source_path` 再判定；仍找不到才告警留静音（并提示素材
+    可能位于草稿目录之外）。
+    """
+    segs = [s for s in track.segments if s.tl_dur_us > 0]
+
+    # ── 时间窗裁剪（按视频分包）──
+    if win_start_us is not None and win_end_us is not None:
+        ws, we = int(win_start_us), int(win_end_us)
+        clipped = []
+        for s in segs:
+            o_start = max(s.tl_start_us, ws)
+            o_end = min(s.tl_start_us + s.tl_dur_us, we)
+            if o_end - o_start <= 0:
+                continue                      # 与窗口无重叠 → 整段丢弃
+            off = o_start - s.tl_start_us     # 窗口起点落在片段中间 → 取材同步偏移
+            clipped.append(replace(
+                s,
+                src_start_us=s.src_start_us + off,
+                src_dur_us=o_end - o_start,
+                tl_start_us=o_start - ws,     # 落点换算到窗口内相对坐标
+                tl_dur_us=o_end - o_start,
+            ))
+        segs = clipped
+        total_us = we - ws
+        windowed = True
+        if not segs:
+            # 该窗口内这条轨没有任何片段 → 仍需产出等长静音，保证各轨对齐
+            log("  · 该区间内无片段，输出全静音（保持各轨等长对齐）")
+    else:
+        windowed = False
+    for s in segs:
+        sp = Path(s.source_path)
+        if not sp.exists():
+            found = resolve_source_path(s.source_path, draft_dir) if draft_dir else None
+            if found:
+                s.source_path = str(found)
+            else:
+                log(f"  [warn] 源文件不存在，该片段留静音: {Path(s.source_path).name}")
+                log(f"         原始 path: {s.source_path}")
+                if draft_dir:
+                    log("         已在草稿目录内按文件名查找，未命中 → "
+                        "素材可能位于草稿目录之外（剪映素材库 / 原始导入位置），需手动定位")
+    segs = [s for s in segs if Path(s.source_path).exists()]
+    if not segs:
+        if windowed:
+            # 分包场景：某条轨在这段视频里本来就没内容 → 补等长静音，别让整批失败
+            sr, bits, ch = resolve_spec(spec_key, track.segments)
+            return write_silence_wav(output_file, total_us / 1e6, sr, bits, ch, log)
+        log("  ✗ 该轨道所有片段源文件均缺失")
+        return False
+
+    sr, bits, ch = resolve_spec(spec_key, segs)
+    total_s = total_us / 1e6
+    if total_s <= 0:
+        total_s = track.end_us / 1e6
+    if total_s <= 0:
+        return False
+
+    layout = "stereo" if ch >= 2 else "mono"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for s in segs:
+        cmd += ["-i", str(Path(s.source_path))]
+
+    chains, labels = [], []
+    for i, s in enumerate(segs):
+        delay_ms = max(int(round(s.tl_start_us / 1000)), 0)
+        src_s = s.src_start_us / 1e6
+        dur_s = s.src_dur_us / 1e6
+        delays = "|".join([str(delay_ms)] * ch)
+        chains.append(
+            f"[{i}:a]atrim=start={src_s:.6f}:duration={dur_s:.6f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates={sr}:channel_layouts={layout},"
+            f"adelay={delays},apad,atrim=0:{total_s:.6f}[s{i}]"
+        )
+        labels.append(f"[s{i}]")
+
+    if len(segs) == 1:
+        chains.append(f"{labels[0]}anull[out]")
+    else:
+        chains.append("".join(labels) +
+                      f"amix=inputs={len(segs)}:duration=longest:normalize=0,"
+                      f"apad,atrim=0:{total_s:.6f}[out]")
+
+    cmd += ["-filter_complex", ";".join(chains), "-map", "[out]",
+            "-ar", str(sr), "-ac", str(ch),
+            "-c:a", PCM_CODEC.get(bits, "pcm_s16le"), str(output_file)]
+
+    # S7（v3.7.0）：timeout 1800 → 300。旧值意味着一条轨卡住要干等 30 分钟
+    # 才报错，期间人类只能看着不动的界面（等同死机）。现在 5 分钟没跑完就
+    # 判失败、写进日志、继续下一条 —— 长轨要真跑满 5 分钟以上请改配置。
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300, **subprocess_kwargs(),)
+    if r.returncode != 0:
+        log(f"  ✗ ffmpeg 整轨失败: {(r.stderr or '').strip()[-300:]}")
+        return False
+    return True
+
+
+# ──────────────────── Extractor（ffmpeg）────────────────────
+
+def extract_audio(seg: AudioSegment, output_file: Path, audio_format: str = "mp3", bitrate_kbps: int = 192) -> bool:
+    """用 ffmpeg 从源文件按时间码切片转码为音频"""
+    src = Path(seg.source_path)
+    if not src.exists():
+        print(f"  [extractor] ✗ 源文件不存在: {src}")
+        return False
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    if seg.start_us > 0:
+        cmd += ["-ss", f"{seg.start_us / 1e6:.3f}"]
+    cmd += ["-i", str(src)]
+    if seg.end_us > seg.start_us:
+        cmd += ["-t", f"{(seg.end_us - seg.start_us) / 1e6:.3f}"]
+
+    if audio_format == "mp3":
+        cmd += ["-ac", "2", "-b:a", f"{bitrate_kbps}k", "-ar", "44100", str(output_file)]
+    else:  # wav
+        cmd += ["-ac", "2", "-ar", "44100", str(output_file)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, **subprocess_kwargs(),)
+    return result.returncode == 0
+
+
+# ──────────────────── Namer ────────────────────
+
+def sanitize_filename(name: str) -> str:
+    """替换非法字符并截断超长文件名
+
+    v2.6.0：连续空格压成单个（模板里可选字段渲染为空后，如 `EP{集数}` 的
+    集数为空时会留下 `EP  DX` 这类空洞，压缩后是 `EP DX`，观感干净）。
+    """
+    name = ILLEGAL_CHARS.sub("_", name)
+    name = re.sub(r" {2,}", " ", name)
+    name = name.strip().strip(".")
+    if len(name) > MAX_FILENAME_LEN:
+        name = name[:MAX_FILENAME_LEN]
+    return name
+
+
+def render_name(template: str, seg: AudioSegment, seq_index: int, remarks: str = "",
+                extra: Optional[dict] = None, type_override: str = "") -> str:
+    """按命名模板渲染目标文件名（不含扩展名）
+
+    v2.5.1：`extra` 可注入所属视频片段解析出的字段（{视频项目}/{集数}/{编号}/
+    {AiFX}/{视频名}）—— 片段模式按视频窗归属时由调用方传入。
+    v2.10.0（Q1）：`type_override` 非空时 {素材类型} 用它（UCS 码
+    FX/MX/DX/AMB/BG/DIA/MUS…），供音效库归档手动指定分类；空 = 自动判定。
+    """
+    import datetime
+    override = (type_override or "").strip()
+    fields = {
+        "项目名": seg.project,
+        # R-码表（v3.10.0）：自动判定按素材命名信息归 DX/FX/BG/MX 四桶；
+        # 手动覆盖值仍优先（可自由填，不限四桶）。
+        "素材类型": override if override else classify_clip_type(
+            seg.material_name, seg.track_type),
+        "序号": seq_index,
+        "原始名": Path(seg.material_name).stem if seg.material_name else Path(seg.source_path).stem,
+        "日期": datetime.date.today().strftime("%Y%m%d"),
+        "时长": int(seg.duration_s),
+        "备注": remarks,
+    }
+    if extra:
+        fields.update({k: v for k, v in extra.items() if v})
+    try:
+        return sanitize_filename(template.format(**fields))
+    except KeyError:
+        # 移除所有未知字段后重新 format（此前只移除一个就返回，导致其余占位符残留）
+        import re as _re
+        known = set(fields.keys())
+        cleaned = _re.sub(
+            r"\{(\w+)(?::[^}]*)?\}",
+            lambda m: m.group(0) if m.group(1) in known else "",
+            template,
+        )
+        return sanitize_filename(cleaned.format(**fields))
+
+
+def chunk_index_for_tl(chunks: List[VideoChunk], tl_start_us: int) -> Optional[int]:
+    """时间线落点 → 所属视频片段的下标；不在任何窗内返回 None。
+
+    v2.5.1 片段模式按视频窗归属的判定核心：音频片段的 tl_start_us 落在
+    哪个 chunk 的 [tl_start_us, tl_end_us) 区间，就归到哪个「集」。
+    ⚠️ 返回**列表下标**（不是 chunk.index 字段）—— 调用方要用它去索引
+    chunk_video_infos() 返回的 infos 列表，两者必须同一套下标。
+    """
+    for i, c in enumerate(chunks):
+        if c.tl_start_us <= tl_start_us < c.tl_end_us:
+            return i
+    return None
+
+
+# ──────────────────── Archiver ────────────────────
+
+def resolve_conflict(output_file: Path, conflict: str = "rename") -> Optional[Path]:
+    """处理文件重名冲突：cover 覆盖 / skip 跳过 / rename 追加 -1 -2"""
+    if conflict == "cover" or not output_file.exists():
+        return output_file
+    if conflict == "skip":
+        return None
+    # rename：追加 -1、-2 后缀
+    i = 1
+    while True:
+        candidate = output_file.with_name(f"{output_file.stem}-{i}{output_file.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _intervals_cover(query_s: int, query_e: int, intervals: List[Tuple[int, int]]) -> bool:
+    """判断 query 区间 [query_s, query_e) 是否被已注册区间的并集完整覆盖"""
+    if not intervals:
+        return False
+    cursor = query_s  # 当前最左需被覆盖的起点
+    for s, e in sorted(intervals):
+        if e <= cursor:
+            continue       # 完全在光标左侧，无贡献
+        if s > cursor:
+            return False   # 起点前有空隙，无法完整覆盖
+        cursor = max(cursor, e)
+        if cursor >= query_e:
+            return True
+    return False
+
+
+def dedupe_check(source_path: str, start_us: int, end_us: int, seen_intervals: dict) -> Optional[str]:
+    """按源文件内容 + 时间区间的并集去重。
+
+    同一文件的多个不同切片各自注册；新区间若被已注册区间的并集完整覆盖
+    （如 video 整段 0~176.5s 覆盖音轨的两个分片），则判为重复返回代表名。
+    """
+    try:
+        with open(source_path, "rb") as f:
+            h = hashlib.sha256(f.read(4096)).hexdigest()
+    except Exception:
+        return None
+    intervals = seen_intervals.setdefault(h, [])
+    if _intervals_cover(start_us, end_us, intervals):
+        return f"{Path(source_path).name} (已含同源切片)"
+    intervals.append((start_us, end_us))
+    return None
+
+
+# ──────────────────── Logger ────────────────────
+
+def setup_logger(log_file: Path):
+    # 先清理旧 handler（GUI 多次导出等场景避免日志重复挂载）
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    logging.basicConfig(
+        filename=str(log_file),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+        filemode="w",
+    )
+    # 同时输出到控制台
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    logging.getLogger().addHandler(console)
+
+
+# ──────────────────── Main ────────────────────
+
+def process_draft(draft_dir: Path, cfg: dict, temp_dir: Path, seen_ids: dict, stats: dict):
+    """处理单个草稿：解密 → 解析 → 提取 → 归档"""
+    # 优先读剪映实际使用的那份（Timelines/<main_timeline_id>/），
+    # 而非根目录的会话快照 —— 见 resolve_draft_content_file 的说明。
+    raw_file = resolve_draft_content_file(draft_dir)
+    print(f"\n[process] 草稿: {draft_dir.name}")
+    if raw_file.parent != draft_dir:
+        print(f"  [info] 内容源: {raw_file.relative_to(draft_dir)}")
+
+    try:
+        decrypted = decrypt_draft_file(raw_file)
+        segments = parse_draft_json(draft_dir, decrypted, cfg.get("extract_video_tracks", True))
+        print(f"  → 解析到 {len(segments)} 个音频片段")
+    except Exception as e:
+        print(f"  ✗ 草稿解析失败: {e}")
+        logging.error(f"草稿 {draft_dir.name} 解析失败: {e}")
+        stats["failed"] += 1
+        return
+
+    conflict = cfg.get("conflict", "rename")
+    audio_format = cfg.get("audio_format", "mp3")
+    bitrate = cfg.get("bitrate_kbps", 192)
+    remarks = cfg.get("remarks", "")
+    # 命名模板多选：勾选的每套模板各生成一份输出
+    templates = cfg.get("name_templates_active") or [cfg.get("name_template") or DEFAULT_CLIPS_TEMPLATE]
+    templates = [t for t in templates if t] or [DEFAULT_CLIPS_TEMPLATE]
+    multi = len(templates) > 1
+    seen_per_tpl = [dict() for _ in templates]   # 每模板独立去重，保证各模板都出全
+
+    # ── v2.5.1 片段模式按视频窗归属：音频片段落到哪个视频片段的区间，
+    #    就归进那个「集」的子文件夹（music/剧甲6/…）。没有视频轨时维持平铺。
+    chunk_infos: Optional[Tuple[List[VideoChunk], List[VideoNameInfo]]] = None
+    if cfg.get("split_by_video"):
+        try:
+            chunks = parse_video_chunks(draft_dir, decrypted)
+        except Exception as e:
+            print(f"  [warn] 视频片段解析失败，片段维持平铺: {e}")
+            chunks = []
+        if chunks:
+            infos = chunk_video_infos(chunks, cfg.get("video_project_answers") or {})
+            chunk_infos = (chunks, infos)
+            missing = [c.material_name for c, inf in zip(chunks, infos) if inf.need_input]
+            if missing:
+                print(f"  ⚠ {len(missing)} 个视频缺项目信息（{('、'.join(missing[:3]))}"
+                      f"{'…' if len(missing) > 3 else ''}）→ 先用原名建文件夹")
+            print(f"  [info] 检测到 {len(chunks)} 个视频片段 → 片段按视频窗归类")
+
+    # S2.2：素材文件名 → 路径 索引只建一次，逐片段复用（旧版每片段 os.walk 整树）
+    media_index = {}
+    for _r, _, _files in os.walk(draft_dir):
+        for _fn in _files:
+            media_index.setdefault(_fn.lower(), (Path(_r) / _fn).resolve())
+
+    for i, seg in enumerate(segments, 1):
+        # 源文件存在性（按草稿根解析 + 树内按名查找，一次性，多模板复用）
+        resolved = resolve_source_path(seg.source_path, draft_dir, media_index)
+        if resolved is None:
+            print(f"  ⏭ 跳过（找不到源文件）: {Path(seg.source_path).name}")
+            logging.warning(f"[SKIP] 源文件缺失: {seg.source_path}")
+            stats["skipped"] += 1
+            continue
+        seg.source_path = str(resolved)
+
+        for ti, template in enumerate(templates, 1):
+            try:
+                # 去重（键 = 文件内容 + 时间切片；按模板隔离）
+                if cfg.get("dedupe", True):
+                    dup = dedupe_check(seg.source_path, seg.start_us, seg.end_us, seen_per_tpl[ti - 1])
+                    if dup:
+                        print(f"  ⏭ 去重跳过（与 {dup} 重复）: {seg.material_name}")
+                        stats["skipped"] += 1
+                        continue
+
+                # v2.5.1 按视频窗归属：片段落在哪个视频片段区间 → 归进哪个「集」
+                # 子文件夹（music/剧甲6/…），并把视频字段注进命名模板。
+                chunk_dir = None
+                extra = None
+                if chunk_infos:
+                    ci = chunk_index_for_tl(chunk_infos[0], seg.tl_start_us)
+                    if ci is not None:
+                        vinfo = chunk_infos[1][ci]
+                        label = sanitize_filename(
+                            vinfo.label or chunk_infos[0][ci].material_name)
+                        if label:
+                            chunk_dir = label
+                        extra = vinfo.as_fields()
+
+                # 命名与归档
+                # v2.10.0（Q1）：{素材类型} 支持手动覆盖（UCS 码）
+                base_name = render_name(template, seg, i, remarks, extra=extra,
+                                        type_override=str(cfg.get("clip_type_override", "") or ""))
+                # S9（v3.9.0）：02-素材片段 常驻输出根，项目打包在其内部（不再按 audio/music 分子目录）
+                # S9（v3.9.0）：分类目录常驻输出根，项目打包在其内部；
+                # 多命名模板时模板子层放在项目之下（裁决⑰甲案：先找项目再挑模板）
+                base_out = Path(cfg.get("output_dir", DEFAULT_CONFIG["output_dir"]))
+                parts = [base_out, "02-素材片段", chunk_dir or draft_dir.name]
+                if multi:
+                    parts.append(f"模板{ti}")
+                category_dir = Path(*parts)
+                category_dir.mkdir(parents=True, exist_ok=True)
+
+                out_file = category_dir / f"{base_name}.{audio_format}"
+                resolved_out = resolve_conflict(out_file, conflict)
+                if resolved_out is None:
+                    print(f"  ⏭ 跳过（已存在）: {out_file.name}")
+                    stats["skipped"] += 1
+                    continue
+
+                # ffmpeg 提取到临时文件再原子移动到归档位置
+                temp_file = temp_dir / f"tmp_{ti}_{i}_{base_name}.{audio_format}"
+                if extract_audio(seg, temp_file, audio_format, bitrate):
+                    temp_file.replace(resolved_out)
+                    tag = f"模板{ti} " if multi else ""
+                    print(f"  ✓ 导出: {tag}{resolved_out.name} ({seg.duration_s:.1f}s)")
+                    logging.info(f"[OK] {draft_dir.name} → {tag}{resolved_out.name}")
+                    stats["success"] += 1
+                else:
+                    print(f"  ✗ ffmpeg 提取失败: {seg.source_path}")
+                    logging.error(f"[FAIL] ffmpeg 提取失败: {seg.source_path}")
+                    stats["failed"] += 1
+            except Exception as e:
+                print(f"  ✗ 片段处理异常: {e}")
+                logging.error(f"[ERROR] {draft_dir.name} 片段异常: {e}", exc_info=True)
+                stats["failed"] += 1
+
+
+def process_draft_tracks(draft_dir: Path, cfg: dict, temp_dir: Path, stats: dict):
+    """整轨模式：一个草稿 → 每条音频轨一个 WAV（等长、带位置信息）+ 可选 AAF。
+
+    输出到 `<输出目录>/<草稿名>/`，一个草稿一个文件夹，可整体拷走。
+    """
+    raw_file = resolve_draft_content_file(draft_dir)
+    print(f"\n[process] 草稿: {draft_dir.name}")
+    if raw_file.parent != draft_dir:
+        print(f"  [info] 内容源: {raw_file.relative_to(draft_dir)}")
+
+    try:
+        decrypted = decrypt_draft_file(raw_file)
+        tracks, total_us = parse_draft_tracks(
+            draft_dir, decrypted, cfg.get("extract_video_tracks", True))
+    except Exception as e:
+        print(f"  ✗ 草稿解析失败: {e}")
+        logging.error(f"草稿 {draft_dir.name} 解析失败: {e}")
+        stats["failed"] += 1
+        return
+
+    # S2.1：整包 json 只读一次，字幕分包循环里复用（旧版每集都 json.load 一遍）
+    _draft_data = None
+    try:
+        with open(decrypted, "r", encoding="utf-8") as _f:
+            _draft_data = json.load(_f)
+    except Exception:
+        _draft_data = None
+
+    total_s = total_us / 1e6
+    print(f"  → {len(tracks)} 条音频轨 ｜ 时间线 {total_s:.3f}s（跟随视频轨）")
+    if not tracks:
+        print("  ⏭ 无可导出的音频轨")
+        return
+
+    conflict = cfg.get("conflict", "rename")
+    spec_key = cfg.get("track_spec", DEFAULT_SPEC_KEY)
+    template = cfg.get("track_name_template") or DEFAULT_TRACK_TEMPLATE
+    remarks = cfg.get("remarks", "")
+    # S9（v3.9.0）：产物类型在上（常驻），项目 / 集名在下
+    output_root = Path(cfg.get("output_dir", DEFAULT_CONFIG["output_dir"]))
+    out_root = output_root / "01-多条WAV" / draft_dir.name
+    out_root.mkdir(parents=True, exist_ok=True)
+    # 临时目录自建，不依赖调用方（execute_export 建了，但单独调用本函数时没有）
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
+
+    # ── v2.5.0 按视频分包：视频轨上每个片段 = 一个交付文件夹 ──
+    chunks: List[VideoChunk] = []
+    if cfg.get("split_by_video"):
+        try:
+            chunks = parse_video_chunks(draft_dir, decrypted)
+        except Exception as e:
+            print(f"  [warn] 视频片段解析失败，退回整轨模式: {e}")
+            chunks = []
+        if not chunks:
+            print("  [info] 该草稿没有视频轨片段 → 退回整轨模式（不分包）")
+
+    if chunks:
+        answers = cfg.get("video_project_answers") or {}
+        infos = chunk_video_infos(chunks, answers)
+        used = set()
+        for ch, info in zip(chunks, infos):
+            # v2.7.0（J10a）：分包文件夹命名模板化 —— 默认 {视频名} 保持现状，
+            # 可用 {视频项目} {集数} {编号} {AiFX} {视频名}（如 {视频项目}{集数}
+            # → 剧甲6，即「根据视频信息/集数打包文件夹」）。渲染失败回退原名。
+            fields = info.as_fields()
+            tpl_split = (cfg.get("split_folder_template") or "{视频名}").strip()
+            try:
+                folder_name = tpl_split.format(**fields)
+            except (KeyError, IndexError, ValueError):
+                folder_name = fields.get("视频名") or ch.material_name
+            folder = sanitize_filename(folder_name or ch.material_name)
+            if folder in used:                       # 同集多个片段 → 加序号区分
+                i = 2
+                while f"{folder}-{i}" in used:
+                    i += 1
+                folder = f"{folder}-{i}"
+            used.add(folder)
+            if info.need_input:
+                print(f"  ⚠ 视频「{ch.material_name}」缺项目名（{info.reason}）"
+                      f" → 先用原名建文件夹：{folder}")
+            out_dir = output_root / "01-多条WAV" / folder
+            out_dir.mkdir(parents=True, exist_ok=True)
+            proj_for_name = info.project or info.raw or draft_dir.name
+            extra = info.as_fields()
+            print(f"  ▸ 视频片段 {ch.index + 1}/{len(chunks)}: {ch.material_name}"
+                  f" → {folder}/（{ch.duration_s:.3f}s）")
+            for t in tracks:
+                try:
+                    base = render_track_name(template, proj_for_name,
+                                             t.display_name, t.index,
+                                             ch.duration_s, remarks, extra=extra,
+                                             category=t.category)
+                    out_file = out_dir / f"{base}.wav"
+                    resolved = resolve_conflict(out_file, conflict)
+                    if resolved is None:
+                        print(f"    ⏭ 跳过（已存在）: {out_file.name}")
+                        stats["skipped"] += 1
+                        continue
+                    temp_file = temp_dir / f"v{ch.index}_trk{t.index}_{base}.wav"
+                    if extract_track_audio(t, total_us, temp_file, spec_key,
+                                           draft_dir=draft_dir,
+                                           win_start_us=ch.tl_start_us,
+                                           win_end_us=ch.tl_end_us):
+                        temp_file.replace(resolved)
+                        print(f"    ✓ {folder}/{resolved.name}")
+                        logging.info(f"[OK] {draft_dir.name}/{folder} → {resolved.name}")
+                        stats["success"] += 1
+                    else:
+                        stats["failed"] += 1
+                except Exception as e:
+                    print(f"    ✗ 轨道处理异常: {e}")
+                    logging.error(f"[ERROR] {draft_dir.name}/{folder} 轨道异常: {e}",
+                                  exc_info=True)
+                    stats["failed"] += 1
+            # v2.6.0：分包模式下**按集导出 AAF**（每集时间窗渲染为一个 .aaf，
+            # 落点换算为集内相对坐标）—— 不再跳过。AAF 描述整条时间线的
+            # 顾虑通过时间窗裁剪解决：集内坐标下它就是一条完整时间线。
+            if cfg.get("export_aaf"):
+                try:
+                    from aaf_writer import write_aaf
+                    aaf_dir = output_root / "03-AAF" / folder
+                    ok, msg = write_aaf(tracks, ch.tl_dur_us, folder, aaf_dir, cfg,
+                                        win_start_us=ch.tl_start_us,
+                                        win_end_us=ch.tl_end_us)
+                    if ok:
+                        print(f"    ✓ AAF: {msg}")
+                        logging.info(f"[OK] AAF {draft_dir.name}/{folder} → {msg}")
+                        stats["success"] += 1
+                    else:
+                        print(f"    ✗ AAF 失败: {msg}")
+                        logging.error(f"[ERROR] {draft_dir.name}/{folder} AAF: {msg}")
+                        stats["failed"] += 1
+                except Exception as e:
+                    print(f"    ✗ AAF 导出异常: {e}")
+                    logging.error(f"[ERROR] {draft_dir.name}/{folder} AAF: {e}",
+                                  exc_info=True)
+                    stats["failed"] += 1
+            # v2.7.0（J10b）：按集导出字幕（文本轨 → srt，时间码按集窗平移）
+            if cfg.get("export_subtitles"):
+                try:
+                    sub_dir = output_root / folder / "字幕"
+                    sub_file = sub_dir / f"{folder}.srt"
+                    n = export_subtitles(
+                        decrypted, sub_file,
+                        win=(ch.tl_start_us, ch.tl_start_us + ch.tl_dur_us),
+                        data=_draft_data)
+                    print(f"    ✓ 字幕: 字幕/{sub_file.name}（{n} 条）")
+                    logging.info(f"[OK] {draft_dir.name}/{folder} 字幕 {n} 条")
+                    stats["success"] += 1
+                except Exception as e:
+                    print(f"    ✗ 字幕导出异常: {e}")
+                    logging.error(f"[ERROR] {draft_dir.name}/{folder} 字幕: {e}",
+                                  exc_info=True)
+                    stats["failed"] += 1
+        return
+
+    for t in tracks:
+        try:
+            base = render_track_name(template, draft_dir.name,
+                                     t.display_name, t.index, total_s, remarks,
+                                     category=t.category)
+            out_file = out_root / f"{base}.wav"
+            resolved = resolve_conflict(out_file, conflict)
+            if resolved is None:
+                print(f"  ⏭ 跳过（已存在）: {out_file.name}")
+                stats["skipped"] += 1
+                continue
+            temp_file = temp_dir / f"trk_{t.index}_{base}.wav"
+            if extract_track_audio(t, total_us, temp_file, spec_key, draft_dir=draft_dir):
+                temp_file.replace(resolved)
+                print(f"  ✓ 整轨: {resolved.name}（{len(t.segments)} 段 / {total_s:.3f}s）")
+                logging.info(f"[OK] {draft_dir.name} → {resolved.name}")
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+        except Exception as e:
+            print(f"  ✗ 轨道处理异常: {e}")
+            logging.error(f"[ERROR] {draft_dir.name} 轨道异常: {e}", exc_info=True)
+            stats["failed"] += 1
+
+    # AAF（可选，默认关）—— v2.6.1 落点统一到 <草稿名>/03-AAF/
+    if cfg.get("export_aaf"):
+        try:
+            from aaf_writer import write_aaf
+            aaf_dir = output_root / "03-AAF" / draft_dir.name
+            ok, msg = write_aaf(tracks, total_us, draft_dir.name, aaf_dir, cfg)
+            if ok:
+                print(f"  ✓ AAF: {msg}")
+                logging.info(f"[OK] AAF {draft_dir.name} → {msg}")
+                stats["success"] += 1
+            else:
+                print(f"  ✗ AAF 失败: {msg}")
+                # v2.10.0：失败也要进文件日志 —— 旧版只 print（仅 GUI 可见），
+                # 导出日志里毫无痕迹，用户事后查「AAF 去哪了」无从下手
+                logging.error(f"[FAIL] AAF {draft_dir.name}: {msg}")
+                stats["failed"] += 1
+        except Exception as e:
+            print(f"  ✗ AAF 导出异常: {e}")
+            logging.error(f"[ERROR] {draft_dir.name} AAF: {e}", exc_info=True)
+            stats["failed"] += 1
+
+    # v2.7.0（J10b）：整轨模式字幕导出（全时间线，无窗口平移）
+    if cfg.get("export_subtitles"):
+        try:
+            sub_file = output_root / draft_dir.name / "字幕" / f"{draft_dir.name}.srt"
+            n = export_subtitles(decrypted, sub_file)
+            print(f"  ✓ 字幕: 字幕/{sub_file.name}（{n} 条）")
+            logging.info(f"[OK] {draft_dir.name} 字幕 {n} 条")
+            stats["success"] += 1
+        except Exception as e:
+            print(f"  ✗ 字幕导出异常: {e}")
+            logging.error(f"[ERROR] {draft_dir.name} 字幕: {e}", exc_info=True)
+            stats["failed"] += 1
+
+
+# ──────────────────── Direct file（拖入音视频，非草稿）────────────────────
+
+def probe_duration_us(path: Path) -> int:
+    """用 ffprobe 读取媒体文件总时长（微秒）；失败返回 0"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **subprocess_kwargs(),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(float(result.stdout.strip()) * 1_000_000)
+    except Exception:
+        pass
+    return 0
+
+
+def process_direct_file(media_file: Path, cfg: dict, temp_dir: Path, seen_ids: dict, stats: dict):
+    """把单个音视频文件整体提取为音频（不走草稿解析）。
+
+    用于「拖入文件」场景：剪映内置素材、已导出成片、外部素材等。
+    """
+    kind = media_kind(media_file) or "audio"
+    conflict = cfg.get("conflict", "rename")
+    audio_format = cfg.get("audio_format", "mp3")
+    bitrate = cfg.get("bitrate_kbps", 192)
+    remarks = cfg.get("remarks", "")
+
+    # 项目名用文件名本身（比所在文件夹名更有辨识度）
+    project = media_file.stem
+    # 探测真实时长，供命名模板 {时长} 字段使用
+    duration_us = probe_duration_us(media_file)
+    seg = AudioSegment(
+        project=project,
+        track_type="video" if kind == "video" else "audio",
+        source_path=str(media_file),
+        start_us=0,                       # 0 表示整轨（extract_audio 会省略 -ss）
+        end_us=duration_us,               # 0 表示到结尾（省略 -t）
+        material_name=media_file.stem,
+        material_id="",
+    )
+
+    print(f"\n[process] 文件: {media_file.name}")
+
+    # 命名模板多选：勾选的每套模板各生成一份输出
+    templates = cfg.get("name_templates_active") or [cfg.get("name_template") or DEFAULT_CLIPS_TEMPLATE]
+    templates = [t for t in templates if t] or [DEFAULT_CLIPS_TEMPLATE]
+    multi = len(templates) > 1
+    seen_per_tpl = [dict() for _ in templates]
+
+    for ti, template in enumerate(templates, 1):
+        try:
+            if cfg.get("dedupe", True):
+                dup = dedupe_check(seg.source_path, 0, 0, seen_per_tpl[ti - 1])
+                if dup:
+                    print(f"  ⏭ 去重跳过（与 {dup} 重复）: {media_file.name}")
+                    stats["skipped"] += 1
+                    continue
+
+            base_name = render_name(template, seg, 1, remarks,
+                                    type_override=str(cfg.get("clip_type_override", "") or ""))
+            # S9（v3.9.0）：02-素材片段 常驻输出根；拖入的散文件没有项目层，
+            # 多命名模板时模板子层放在分类目录之下（与裁决⑰甲案一致的思路）
+            base_out = Path(cfg.get("output_dir", DEFAULT_CONFIG["output_dir"]))
+            parts = [base_out, "02-素材片段"]
+            if multi:
+                parts.append(f"模板{ti}")
+            category_dir = Path(*parts)
+            category_dir.mkdir(parents=True, exist_ok=True)
+
+            out_file = category_dir / f"{base_name}.{audio_format}"
+            resolved = resolve_conflict(out_file, conflict)
+            if resolved is None:
+                print(f"  ⏭ 跳过（已存在）: {out_file.name}")
+                stats["skipped"] += 1
+                continue
+
+            temp_file = temp_dir / f"tmp_direct_{ti}_{base_name}.{audio_format}"
+            if extract_audio(seg, temp_file, audio_format, bitrate):
+                temp_file.replace(resolved)
+                tag = f"模板{ti} " if multi else ""
+                print(f"  ✓ 导出: {tag}{resolved.name}")
+                logging.info(f"[OK] {media_file.name} → {tag}{resolved.name}")
+                stats["success"] += 1
+            else:
+                print(f"  ✗ ffmpeg 提取失败: {media_file}")
+                logging.error(f"[FAIL] ffmpeg 提取失败: {media_file}")
+                stats["failed"] += 1
+        except Exception as e:
+            print(f"  ✗ 文件处理异常: {e}")
+            logging.error(f"[ERROR] {media_file} 处理异常: {e}", exc_info=True)
+            stats["failed"] += 1
+
+
+def resolve_source_path(src: str, draft_dir: Path,
+                        index: dict = None) -> Optional[Path]:
+    """把素材 path 解析成真实存在的绝对路径。
+
+    剪映 audio/video 素材的 `path` 通常是**相对草稿根**的相对路径
+    （如 `audio/FX_xxx.wav` 或 `./audio/...`）。工具以 exe 目录为 CWD 运行，
+    直接 `Path(path).exists()` 会因相对基准错误而找不到本就存在的文件
+    （表现为「工程内有声、导出却报源文件缺失」）。
+
+    解析顺序：
+      1. 原样（绝对路径，或恰好相对 CWD 命中）；
+      2. 相对草稿根（`draft_dir / path`）—— 修复 CWD 基准 bug；
+      3. 草稿目录树内按文件名递归查找（path 写法/层级差异兜底）。
+    都失败返回 None —— 此时素材确实不在草稿内（可能在剪映素材库或原始导入位置），
+    应告警而非静默。
+    """
+    if not src:
+        return None
+    p = Path(src)
+    if p.exists():
+        return p.resolve()
+    rel = draft_dir / p
+    if rel.exists():
+        return rel.resolve()
+    name = p.name
+    if name:
+        if index is not None:
+            hit = index.get(name.lower())
+            return hit
+        for root, _, files in os.walk(draft_dir):
+            if name in files:
+                return (Path(root) / name).resolve()
+    return None
+
+
+
+def processed_state_file(data_dir: Path) -> Path:
+    """断点续跑状态文件落点（v2.6.0：进数据目录，不再混在产物区）。
+
+    旧版写在输出目录根 `.processed_drafts.txt`（点开头、Windows 里藏着头尾
+    都不好操作）；v2.6.0 改名 `processed_drafts.txt` 并搬进 data_dir。
+    """
+    return Path(data_dir) / "processed_drafts.txt"
+
+
+def migrate_legacy_state(output_dir: Path, data_dir: Path) -> None:
+    """旧状态文件一次性迁移：输出目录根 `.processed_drafts.txt` → data_dir。
+
+    幂等：新文件已存在时不搬（避免覆盖更新的状态）。
+    """
+    legacy = Path(output_dir) / ".processed_drafts.txt"
+    target = processed_state_file(data_dir)
+    try:
+        if legacy.is_file() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy, target)
+            print(f"  [info] 断点续跑记录已迁移: {legacy} → {target}")
+    except Exception as e:
+        print(f"  [warn] 旧断点续跑记录迁移失败（不影响导出）: {e}")
+
+
+def load_processed(data_dir: Path) -> set:
+    """加载已处理草稿记录（断点续跑）"""
+    state_file = processed_state_file(data_dir)
+    if state_file.exists():
+        return set(state_file.read_text(encoding="utf-8").splitlines())
+    return set()
+
+
+def save_processed(data_dir: Path, name: str, processed: set):
+    """追加已处理草稿记录"""
+    if name not in processed:
+        processed.add(name)
+        state_file = processed_state_file(data_dir)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file, "a", encoding="utf-8") as f:
+            f.write(name + "\n")
+
+
+# ──────────────────── 配置（已移至 core/config.py）────────────────────
+# DEFAULT_CONFIG / DEFAULT_IMPORT_CONFIG / CONFIG_FIELDS / load_config /
+# save_config / ask / parse_bool / init_config 均在 core/config.py，
+# 本模块顶部已 import，名字保持兼容（CLI / GUI / tab 行为不变）。
+
+
+def check_environment() -> dict:
+    """环境自检：Python / ffmpeg / 剪映 / jy-draftc"""
+    print("=" * 56)
+    print("环境自检")
+    print("=" * 56)
+
+    checks = {}
+
+    # Python
+    py = sys.version_info
+    ok = py.major == 3 and py.minor >= 9
+    checks["Python"] = (ok, f"{py.major}.{py.minor}.{py.micro} (需要 3.9+)")
+    print(f"  [{'✓' if ok else '✗'}] Python {checks['Python'][1]}")
+
+    # ffmpeg
+    ffmpeg_ok = False
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=15, **subprocess_kwargs(),)
+        ffmpeg_ok = r.returncode == 0 and "ffmpeg version" in r.stdout
+    except Exception:
+        pass
+    checks["ffmpeg"] = (ffmpeg_ok, "ffmpeg 命令可用" if ffmpeg_ok else "未找到 ffmpeg（winget install Gyan.FFmpeg）")
+    print(f"  [{'✓' if ffmpeg_ok else '✗'}] {checks['ffmpeg'][1]}")
+
+    # 剪映
+    jy_dir = find_jianying_install_dir()
+    checks["剪映"] = (jy_dir is not None, jy_dir.name if jy_dir else "未找到剪映 videoeditor.dll（请先安装剪映专业版）")
+    print(f"  [{'✓' if jy_dir else '✗'}] {checks['剪映'][1]}")
+
+    # jy-draftc
+    draftc = JY_DRAFTC_EXE.exists()
+    checks["jy-draftc"] = (draftc, "解密工具就绪" if draftc else f"未找到 jy-draftc（{JY_DRAFTC_EXE}）")
+    print(f"  [{'✓' if draftc else '✗'}] {checks['jy-draftc'][1]}")
+
+    return checks
+
+
+# ──────────────────── Pro Tools 可用性（导入页「选 .ptx」前置条件）────────────────────
+
+# 探测逻辑已收敛到 core/host.py（L0 卡顿修复 + 分层起点）。
+# 此处保留同名引用，确保 CLI / GUI（core.pro_tools_status）行为不变。
+from core.host import pro_tools_status, PT_URL, subprocess_kwargs
+
+
+# ──────────────────── 非交互参数 ────────────────────
+
+def apply_cli_overrides(cfg: dict, args: list) -> dict:
+    """从命令行覆盖配置（供 Skill / 无交互场景）并消费对应参数。
+    支持的覆盖参数：--output-dir --format --bitrate --conflict --name-template --remarks
+                    --no-video-track --no-dedupe --refresh
+                    --mode --spec --track-template --aaf --aaf-embed
+    未识别参数保留在 args 中（仍可用于位置参数 = 草稿目录）。"""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--mode" and i + 1 < len(args):
+            cfg["export_mode"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--spec" and i + 1 < len(args):
+            cfg["track_spec"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--track-template" and i + 1 < len(args):
+            cfg["track_name_template"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--aaf":
+            cfg["export_aaf"] = True; del args[i]
+        elif a == "--aaf-embed":
+            cfg["export_aaf"] = True; cfg["aaf_media_mode"] = "embed"; del args[i]
+        elif a == "--subtitles":
+            cfg["export_subtitles"] = True; del args[i]
+        elif a == "--output-dir" and i + 1 < len(args):
+            cfg["output_dir"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--format" and i + 1 < len(args):
+            cfg["audio_format"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--bitrate" and i + 1 < len(args):
+            try: cfg["bitrate_kbps"] = int(args[i + 1])
+            except ValueError: pass
+            del args[i:i + 2]
+        elif a == "--conflict" and i + 1 < len(args):
+            cfg["conflict"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--name-template" and i + 1 < len(args):
+            cfg["name_template"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--remarks" and i + 1 < len(args):
+            cfg["remarks"] = args[i + 1]; del args[i:i + 2]
+        elif a == "--no-video-track":
+            cfg["extract_video_tracks"] = False; del args[i]
+        elif a == "--no-dedupe":
+            cfg["dedupe"] = False; del args[i]
+        elif a == "--refresh":
+            cfg["skip_existing"] = False; del args[i]
+        elif a == "--resume":
+            # v2.10.0：与 --refresh 对称 —— 显式开启断点续跑（默认已改为关）
+            cfg["skip_existing"] = True; del args[i]
+        else:
+            i += 1
+    return cfg
+
+
+def execute_export(cfg: dict, root: Path, log_file: Optional[Path] = None,
+                   draft_dirs: Optional[List[Path]] = None,
+                   media_files: Optional[List[Path]] = None) -> dict:
+    """执行完整导出流程（输出准备 → 扫描 → 逐草稿处理 → 汇总）。
+
+    被 CLI main() 与 GUI（gui.py）共用。返回统计 dict:
+    {"success": int, "failed": int, "skipped": int}
+
+    draft_dirs / media_files 非空时直接使用该列表（拖拽场景），
+    否则回退到按 root 目录扫描。
+    """
+    output_dir = Path(cfg.get("output_dir", DEFAULT_CONFIG["output_dir"]))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── v2.6.0：日志 / 运行数据与产物分离 ──
+    # log_dir → 导出日志.log；data_dir → processed_drafts.txt / tmp 临时文件。
+    # 两者留空时回落输出目录根（兼容旧习惯）。
+    def _resolve_dir(key: str) -> Path:
+        raw = (cfg.get(key) or "").strip() if isinstance(cfg.get(key), str) else ""
+        p = Path(raw) if raw else output_dir
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    log_dir = _resolve_dir("log_dir")
+    data_dir = _resolve_dir("data_dir")
+
+    temp_dir = Path(cfg["temp_dir"]) if cfg.get("temp_dir") else (data_dir / "tmp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    if log_file is None:
+        log_file = log_dir / "导出日志.log"
+    setup_logger(log_file)
+
+    mode = cfg.get("export_mode", ["tracks"])
+    if isinstance(mode, str):
+        mode = [mode]
+    mode_set = set(mode) & {"tracks", "clips"}
+    if not mode_set:
+        mode_set = {"tracks"}
+    mode_label = "、".join(
+        ("整轨（一条轨一个 WAV，等长对齐）" if m == "tracks"
+         else "片段（一段一个文件）") for m in ("tracks", "clips") if m in mode_set)
+    print(f"剪映草稿目录: {root}")
+    print(f"输出目录:     {output_dir}")
+    print(f"导出模式:     {mode_label}\n")
+
+    stats = {"success": 0, "failed": 0, "skipped": 0}
+    seen_ids = {}
+    migrate_legacy_state(output_dir, data_dir)     # 旧状态文件一次性搬进数据目录
+    processed = load_processed(data_dir)
+    skip_existing = cfg.get("skip_existing", True)
+
+    # 直接文件（拖入音视频）优先处理
+    for f in (media_files or []):
+        process_direct_file(Path(f), cfg, temp_dir, seen_ids, stats)
+
+    drafts = [Path(d) for d in draft_dirs] if draft_dirs else scan_drafts(root)
+
+    for d in drafts:
+        # 断点续跑：已处理草稿跳过
+        if skip_existing and d.name in processed:
+            print(f"[skip] 已处理草稿，跳过: {d.name}")
+            continue
+        if "tracks" in mode_set:
+            process_draft_tracks(d, cfg, temp_dir, stats)
+        if "clips" in mode_set:
+            process_draft(d, cfg, temp_dir, seen_ids, stats)
+        save_processed(data_dir, d.name, processed)
+
+    # 清理临时目录
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # 汇总报告
+    print(f"\n{'='*60}")
+    print(f"统计：成功 {stats['success']} ｜ 失败 {stats['failed']} ｜ 跳过 {stats['skipped']}")
+    print(f"日志：{log_file}")
+    return stats
+
+
+def _safe_io():
+    """打包为 --windowed exe 时 stdout/stderr 可能为 None；
+    且中文 Windows 控制台默认 GBK 无法编码 ✓/✗ 等字符。
+    兜底：None → devnull；可 reconfigure 的流 → UTF-8（errors=replace 防崩）。"""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+            except Exception:
+                pass
+        elif hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def main():
+    _safe_io()
+    args = sys.argv[1:]
+    cfg_path = CONFIG_PATH
+
+    # --init：进入初始化向导
+    if "--init" in args:
+        init_config(cfg_path)
+        return
+
+    # --check：仅环境自检
+    if "--check" in args:
+        check_environment()
+        return
+
+    cfg = load_config(cfg_path)
+
+    # 首次运行（无配置或缺少 output_dir）：强制进入初始化向导
+    if not cfg.get("output_dir"):
+        print("⚠ 尚未初始化配置，进入初始化向导…\n")
+        cfg = init_config(cfg_path)
+
+    # CLI 覆盖（供无交互 / Skill 场景）；消费覆盖参数后剩余留作位置参数
+    args = list(sys.argv[1:])
+    cfg = apply_cli_overrides(cfg, args)
+
+    # 输入目录：命令行位置参数优先 > config > 默认剪映草稿目录
+    # 位置参数可为「文件夹 / 剪映草稿 JSON / 音视频文件」，自动智能识别
+    pos_args = [a for a in args if not a.startswith("--")]
+    if pos_args:
+        draft_dirs, root, _file_mode = resolve_input_paths([Path(a) for a in pos_args])
+        execute_export(cfg, root, draft_dirs=draft_dirs)
+    elif cfg.get("input_dir"):
+        root = Path(cfg["input_dir"])
+        execute_export(cfg, root)
+    else:
+        root = DEFAULT_JIANYING_DRAFT_ROOT
+        execute_export(cfg, root)
+
+
+if __name__ == "__main__":
+    main()
