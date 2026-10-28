@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""v4 阶段 C · 剪映工程工具包的 js_api 桥：HTML 前端 ↔ Python 核心（三页签）。
+"""v4 阶段 C · 剪映工程工具包的 js_api 桥：HTML 前端 ↔ Python 核心（导入和导出）。
 
 与 pt_api.py 的差异（30 号方案 §阶段 C）：
 - pt-tools 复用 = 子进程 CLI；剪映复用 = **同进程函数直调**（gui.py 同款）：
   `import main`（main.py 是纯逻辑模块，无 tkinter 副作用，re-export 了
   load_config / videoname / pro_tools_status 全套）；
-- 长任务（导入/导出/分离）= 后台线程 + ``contextlib.redirect_stdout`` 泵；
+- 长任务（导入/导出）= 后台线程 + ``contextlib.redirect_stdout`` 泵；
   重定向仅作用于任务线程，不影响 httpd / 壳自身日志；
 - 分包缺视频项目名 = **两段式**：``export_phase1`` 返回 pending 清单 →
   前端渲染补录表单 → ``run_export(answers)`` 合并后执行
@@ -95,7 +95,6 @@ class JyApi(HPreferencesMixin):
         self._init_h_preferences("jy")
         self._task_lock = threading.Lock()
         self._busy = False
-        self._demucs_cmd: list | None = None
         self._export_ctx: dict | None = None   # phase1 → run_export 的上下文
 
     # ---------- 界面偏好（家族级：与 pt-tools 共用 ptools C2 配置层） ----------
@@ -476,71 +475,3 @@ class JyApi(HPreferencesMixin):
                           stats.get("skipped", 0)))
 
         return self._run_bg(job, "✓ 导出完成")
-
-    # ---------- 分离页（Demucs） ----------
-
-    def check_demucs(self) -> dict:
-        """demucs 可用性检测（同 SeparationTab：PATH 命令优先，非冻结再探 -m）。"""
-        exe = shutil.which("demucs")
-        if exe:
-            self._demucs_cmd = [exe]
-            return {"ok": True, "via": "PATH", "cmd": exe}
-        if not getattr(sys, "frozen", False):
-            try:
-                r = subprocess.run(
-                    [sys.executable, "-c",
-                     "import demucs; print(getattr(demucs, '__version__', ''))"],
-                    capture_output=True, text=True, timeout=20)
-                if r.returncode == 0:
-                    self._demucs_cmd = [sys.executable, "-m", "demucs"]
-                    return {"ok": True, "via": "python",
-                            "ver": (r.stdout or "").strip()}
-            except Exception:
-                pass
-        self._demucs_cmd = None
-        return {"ok": False,
-                "message": "Demucs 未安装——请运行 pip install demucs 后重新检测"}
-
-    def run_separation(self, inp: str, out: str, stems: str = "vocals") -> dict:
-        """执行人声分离（demucs 子进程逐文件，gui._run_demucs 同逻辑）。"""
-        inp = (inp or "").strip()
-        out = (out or "").strip()
-        if not self._demucs_cmd:
-            return {"ok": False, "message": "Demucs 未就绪，请先「重新检测」"}
-        if not inp or not Path(inp).exists():
-            return {"ok": False, "message": "请选择要分离的音频文件或目录"}
-        if not out:
-            out = str(Path(inp).parent / "separated")
-        Path(out).mkdir(parents=True, exist_ok=True)
-        try:
-            jy = _jy()
-            cfg = self._load_cfg(jy)
-            cfg.update({"sep_input": inp, "sep_output": out, "sep_stems": stems})
-            jy["main"].save_config(cfg)
-        except Exception:
-            pass
-
-        def job():
-            p = Path(inp)
-            if p.is_dir():
-                files = [str(x) for x in p.iterdir()
-                         if x.suffix.lower() in (".wav", ".mp3", ".m4a", ".flac")]
-            else:
-                files = [inp]
-            if not files:
-                self._emit("[错误] 没找到音频文件", "err")
-                return
-            self._emit("[信息] 共 %d 个文件，输出到 %s" % (len(files), out))
-            for i, f in enumerate(files, 1):
-                self._emit("[%d/%d] %s" % (i, len(files), Path(f).name))
-                cmd = list(self._demucs_cmd) + ["-o", out]
-                if stems == "vocals":
-                    cmd.append("--two-stems=vocals")
-                cmd.append(f)
-                self._emit("  $ " + " ".join(cmd))
-                r = subprocess.run(cmd)
-                self._emit("  [失败] 返回码 %s" % r.returncode if r.returncode
-                           else "  [完成]", "" if r.returncode else "ok")
-            self._emit("[全部完成] 产物在: %s" % out)
-
-        return self._run_bg(job, "✓ 分离完成")

@@ -133,6 +133,8 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
         cmd += ["--paths", str(REPO / "src" / "jianying-draft-toolkit" / "code")]
     if key == "re":
         cmd += ["--paths", str(REPO / "src" / "rename-unify" / "code")]
+    cmd += ["--collect-all", "webview", "--collect-all", "pythonnet"]
+    cmd += ["--collect-all", "aaf2", "--hidden-import", "main", "--hidden-import", "import_audio"]
     cmd += ["--exclude-module", "tkinter", "--exclude-module", "PyQt5",
             "--exclude-module", "IPython", "--exclude-module", "pytest"]
     cmd.append(str(entry_file))
@@ -168,6 +170,17 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
         print("[v4-pack] OK %s -> %s" % (key, zh_exe))
     else:
         print("[v4-pack] WARN %s: exe not found at %s" % (key, exe))
+    # Ship only the reviewed converter files; never copy a machine-local .env.
+    converter = REPO / "src" / "jianying-draft-toolkit" / "tools" / "jy-draftc" / "jy-draftc-amd64-windows"
+    destination = final / "tools" / "jy-draftc" / "jy-draftc-amd64-windows"
+    destination.mkdir(parents=True, exist_ok=True)
+    for filename in ("jy-draftc.exe", "LICENSE", "README.md", "SHA256SUMS.txt", ".env.example"):
+        source = converter / filename
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        shutil.copy2(source, destination / filename)
+    from finish_distribution import finish_distribution
+    finish_distribution(final, REPO, key)
     return 0
 
 

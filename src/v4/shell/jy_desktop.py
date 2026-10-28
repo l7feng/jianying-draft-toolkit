@@ -3,7 +3,7 @@
 
 与 shell/desktop_app.py（pt-tools 壳）同构，差异：
 - js_api 桥 = api.jy_api.JyApi（同进程函数直调剪映核心）；
-- 页面 = /jy.html（三页签：导入 / 导出 / 人声分离）；
+- 页面 = /jy.html（导入 / 导出）；
 - 端口 = 26790（pt 壳 26789 占用 +1 自愈同样生效）。
 
 用法：

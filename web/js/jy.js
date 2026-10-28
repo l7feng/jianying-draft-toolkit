@@ -16,7 +16,6 @@ const state = {
   logN: 0,
   busy: false,
   phase1Ok: false,     // 解析输入完成才允许开始导出
-  demucsOk: false,
   ofxBusy: false, ofxRunning: false, ofxItems: [], ofxRoot: "",
 };
 
@@ -55,10 +54,10 @@ window.__onShellEvent = onShellEvent;
 window.__onJyEvent = onShellEvent;
 
 /* ── 页签路由 ── */
-const PAGES = ["import", "export", "sep", "ofx"];
+const PAGES = ["import", "export", "ofx"];
 function goto(page) {
+  if (!PAGES.includes(page)) page = "import";
   if (page === "ofx") refreshOfx();
-  if (page === "sep" && !state.demucsOk) demucsCheck(true);
   $("ptStatusWrap").hidden = page !== "import";
   PAGES.forEach((p) => {
     $("page-" + p).classList.toggle("on", p === page);
@@ -143,12 +142,7 @@ function fillExportCfg(cfg) {
   $("expVideoTracks").checked = cfg.extract_video_tracks !== false;
   $("expSkipExisting").checked = !!cfg.skip_existing;
   $("expRemarks").value = cfg.remarks || "";
-  $("sepIn").value = cfg.sep_input || "";
-  $("sepOut").value = cfg.sep_output || "";
-  if (cfg.sep_stems) {
-    const r = document.querySelector("input[name=sepStems][value='" + cfg.sep_stems + "']");
-    if (r) r.checked = true;
-  }
+
 }
 async function loadExportCfg() {
   if (!api()) return;
@@ -258,33 +252,6 @@ function pendingSubmit() {
   exportRun(answers);
 }
 
-/* ══════════ 页 3：人声分离 ══════════ */
-async function demucsCheck(silent) {
-  if (!api()) {
-    $("sepEnv").textContent = "模型环境：演示态（需壳内检测）";
-    return;
-  }
-  try {
-    const r = await api().check_demucs();
-    state.demucsOk = !!r.ok;
-    $("sepEnv").innerHTML = r.ok
-      ? "模型环境：<span style='color:var(--green,#4a4)'>✓ Demucs 就绪</span>" +
-        (r.ver ? "（" + esc(r.ver) + "）" : "") + "　via " + esc(r.via || "")
-      : "模型环境：<span style='color:var(--red)'>✗ " + esc(r.message || "未安装") + "</span>";
-    if (!silent) log(r.ok ? "✓ Demucs 就绪" : "✗ " + (r.message || "Demucs 未安装"), r.ok ? "ok" : "err");
-  } catch (e) { if (!silent) log("检测异常：" + e, "err"); }
-}
-async function sepRun() {
-  await window.ToolPrefs.flush();
-  if (!api()) { log("演示态：分离需在壳内运行", "info"); return; }
-  if (!state.demucsOk) { log("Demucs 未就绪——请先「重新检测」或 pip install demucs", "err"); return; }
-  const stems = (document.querySelector("input[name=sepStems]:checked") || {}).value || "vocals";
-  try {
-    const r = await api().run_separation($("sepIn").value.trim(), $("sepOut").value.trim(), stems);
-    log(r.ok ? "✓ " + r.message : "✗ " + r.message, r.ok ? "ok" : "err");
-  } catch (e) { log("分离异常：" + e, "err"); }
-}
-
 /* ── 状态轮询（PTSL） ── */
 async function pollStatus() {
   if (!api() || !$("page-import").classList.contains("on") || state.busy) return;
@@ -306,7 +273,7 @@ function syncWorkflow() {
   document.querySelectorAll('[data-export-feature]').forEach(el => el.hidden=!visible[el.dataset.exportFeature]);
   $('expBitrate').disabled=busy || $('expFmt').value!=='mp3';
   $('btnExportRun').disabled=busy || !state.phase1Ok || !!state.hasPending;
-  ['btnPhase1','btnImpPreview','btnImpRun','btnPendingOk','btnSepRun'].forEach(id => $(id).disabled=busy);
+  ['btnPhase1','btnImpPreview','btnImpRun','btnPendingOk'].forEach(id => $(id).disabled=busy);
   $('btnOfxInstall').disabled=busy || state.ofxRunning || !HAS_BRIDGE();
   $('btnOfxRefresh').disabled=state.ofxBusy;
   document.querySelectorAll('[data-ofx-delete]').forEach(el => el.disabled=el.dataset.ofxInvalid==="true"||state.ofxBusy||state.ofxRunning||state.busy);
@@ -409,29 +376,19 @@ async function init() {
     if (api()) { try { await api().open_path(d); } catch (e) {} }
     else log("演示态：打开目录需在壳内运行", "info");
   };
-  $("btnSepRun").onclick = sepRun;
-  $("btnSepRecheck").onclick = () => demucsCheck(false);
-  $("btnSepOpen").onclick = async () => {
-    const d = $("sepOut").value.trim();
-    if (!d) { log("先填分离输出目录", "err"); return; }
-    if (api()) { try { await api().open_path(d); } catch (e) {} }
-  };
-  $("sepBrowseIn").onclick = () => pickFile("sepIn", "选择音频文件", "audio");
-  $("sepBrowseOut").onclick = () => pickDir("sepOut", "选择输出目录");
   $("btnClear").onclick = () => { $("log").innerHTML = ""; state.logN = 0; $("logCnt").textContent = "（0 条）"; };
 
   if (HAS_BRIDGE()) {
     state.bridgeLoaded=true;
     
     await loadExportCfg();
-    // Model detection is deferred until the separation page is opened.
     pollStatus();
     setInterval(pollStatus, 10000);
     log("✓ 工具已就绪", "ok");
   } else {
     $("demoTip").style.display = "";
     $("ptText").textContent = "PTSL —（演示态不探测）";
-    setTimeout(() => log("提示：浏览器演示态——导入/导出/分离需在壳内运行（python shell/jy_desktop.py）", "info"), 200);
+    setTimeout(() => log("提示：浏览器演示态——导入/导出需在壳内运行（python shell/jy_desktop.py）", "info"), 200);
   }
   window.dispatchEvent(new Event('toolready'));
 }
