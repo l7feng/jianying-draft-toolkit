@@ -3,7 +3,7 @@
 """ScrollableFrame —— 可滚动容器（G2/J12 2026-09-27；S8 手感重做 2026-09-27）。
 
 ⚠️ **同源副本**：本文件、`src/pt-tools/ptools/gui/scrollable.py`、
-`src/jianying-draft-toolkit/code/tabs/base.py::ScrollableFrame` **三处同源**，
+`src/jy-tools/code/tabs/base.py::ScrollableFrame` **三处同源**，
 改一处必须同步三处（工具各自独立打包，不引公共包）。
 `tests/test_scroll_sync.py` 会断言三份一致 —— 别绕过它。
 同步方法：改本文件后跑 `python tools/sync_scrollable.py`（一次性脚本，

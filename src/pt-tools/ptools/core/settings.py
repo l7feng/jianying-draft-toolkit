@@ -50,7 +50,7 @@ DEFAULT_DELIVERY_ROOT = _home_default("My-Temporary", "Backup-Deliver",
 # 配置落点（W4 · 2026-09-24 拍板：四工具统一 **exe 旁**，便携、随 exe 走）
 # ---------------------------------------------------------------------------
 # 旧版 pt-tools 配置/日志在 %APPDATA%\pt-tools\，两机同步时与
-# 「剪映 / rename-unify 已是 exe 旁」的行为不一致。现在统一 exe 旁：
+# 「剪映 / rename-project 已是 exe 旁」的行为不一致。现在统一 exe 旁：
 #   frozen：exe 所在目录；源码模式：src/pt-tools（本文件向上三级）。
 # 首次运行时若 exe 旁还没有 config.json，会把旧 %APPDATA% 的一份**复制**过来
 # （迁移不删旧文件，见 config.migrate_legacy_config）。
@@ -113,8 +113,8 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # 版本与构建日期
 # ---------------------------------------------------------------------------
 # 四工具统一口径：版本号 X.Y.Z（不带 v 前缀），标题/关于里写 vX.Y.Z (YYYY-MM-DD)。
-# ⚠️ build_date() 在 pt-project-folder-builder / jianying-draft-toolkit /
-#    rename-unify 各有一份逐字相同的实现（各工具独立打包、无共享模块），
+# ⚠️ build_date() 在 pt-project-folder-builder / jy-tools /
+#    rename-project 各有一份逐字相同的实现（各工具独立打包、无共享模块），
 #    改动时四处需同步。
 # v1.4.0（2026-09-24）：① 建档/档案/输出默认路径收口（profile_dir=json 目录、
 #   last_out_dir=out 目录，_migrate_cfg 2→3 只补缺不覆盖）② 档案平铺存放，

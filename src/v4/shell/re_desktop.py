@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v4 阶段 D · 统一命名工具壳入口：pywebview(WebView2) 优先；Edge --app 回退。
+"""v4 阶段 D · Rename Project壳入口：pywebview(WebView2) 优先；Edge --app 回退。
 
 与 shell/desktop_app.py（pt 壳 26789）/ shell/jy_desktop.py（剪映壳 26790）同构：
 - js_api 桥 = api.re_api.ReApi（同进程函数直调 core_rules/foldertree/config）；
@@ -25,7 +25,7 @@ from api.re_api import ReApi  # noqa: E402
 PAGE = "re.html"
 DEFAULT_PORT_RE = 26791
 from shell.app_version import tool_version
-TITLE = "统一命名工具 v" + tool_version("re")
+TITLE = "Rename Project v" + tool_version("re")
 
 
 def run_pywebview(port: int) -> None:
@@ -72,7 +72,7 @@ def run_edge(port: int) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="统一命名工具 v4 壳入口（阶段 D）")
+    ap = argparse.ArgumentParser(description="Rename Project v4 壳入口（阶段 D）")
     ap.add_argument("--shell", choices=["auto", "pywebview", "edge"], default="auto")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT_RE)
     args = ap.parse_args()

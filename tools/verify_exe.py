@@ -32,8 +32,8 @@ for _s in (sys.stdout, sys.stderr):
 
 # 出口布局（2026-09-27 人类裁决②，与 tools/build.py 的 TARGETS 同源）：
 #   <root>/pt-tools-v<工具版本>-<日期>/                 ← Pro Tools工具箱.exe
-#   <root>/jianying-draft-toolkit-v<工具版本>-<日期>/   ← 剪映工程工具包.exe
-#   <root>/rename-unify-v<工具版本>-<日期>/             ← 统一命名工具.exe
+#   <root>/02-JY Tools/jy-tools-H-v<工具版本>/   ← JY Tools-H.exe
+#   <root>/rename-project-v<工具版本>-<日期>/             ← Rename Project.exe
 #   <root>/script-splitter-v.../                       ← 独立仓库自建自检
 #
 # ⚠️ 2026-09-27 深夜修正：**一工具一目录，exe 直接躺在目录根下**。
@@ -43,14 +43,14 @@ for _s in (sys.stdout, sys.stderr):
 #    第三列 = 目录定位键（不是"家族"），各工具自己一套目录通配。
 APPS = [
     ("pt-tools", "Pro Tools工具箱", "pt-tools"),
-    ("jianying-draft-toolkit", "剪映工程工具包", "jianying"),
-    ("rename-unify", "统一命名工具", "rename-unify"),
+    ("jy-tools", "JY Tools", "jianying"),
+    ("rename-project", "Rename Project", "rename-project"),
 ]
 # 定位键 → 出口目录通配（含历史 ASCII 命名，保证旧目录仍可核验）
 FAMILY_GLOBS = {
     "pt-tools": ("pt-tools-v*",),
-    "jianying": ("jianying-draft-toolkit-v*", "jianying-toolkit-v*", "jianying-v*"),
-    "rename-unify": ("rename-unify-v*", "统一命名工具-v*"),
+    "jianying": ("jy-tools-v*", "jianying-toolkit-v*", "jianying-v*"),
+    "rename-project": ("rename-project-v*", "Rename Project-v*"),
 }
 def _default_exe_root():
     r"""与 tools/build.py 同链（裁决 10-9 甲案）：PT_EXE_ROOT → build.local.json
@@ -82,7 +82,7 @@ CHECKS = [
     ("pt-tools 内置技能 pt-cleaner",
      "Pro Tools工具箱", "_internal/skills/pt-cleaner/scripts/pt_clean.py", "pt-tools"),
     ("jianying 解密器 jy-draftc.exe",
-     "剪映工程工具包", "tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe", "jianying"),
+     "JY Tools", "tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe", "jianying"),
 ]
 
 # 可选附属项：缺了不影响判定，只打 INFO。
@@ -90,7 +90,7 @@ CHECKS = [
 # 见 Q10），该依赖已不再需要；保留检查只为观察是否仍被打包进去。
 OPTIONAL_CHECKS = [
     ("jianying 拖拽依赖 tkinterdnd2（v2.6.2 起已不需要）",
-     "剪映工程工具包", "_internal/tkinterdnd2", "jianying"),
+     "JY Tools", "_internal/tkinterdnd2", "jianying"),
 ]
 
 user32 = ctypes.windll.user32

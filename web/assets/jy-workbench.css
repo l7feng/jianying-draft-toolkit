@@ -1,4 +1,4 @@
-/* Jianying workflow layout, inheriting the established Rename Unify skin. */
+/* Jianying workflow layout, inheriting the established Rename Project skin. */
 .jy-calm-ui [hidden]{display:none!important}
 .jy-calm-ui main{max-width:1400px;margin:0 auto;width:100%;padding-bottom:64px;box-sizing:border-box}
 .jy-calm-ui .page-heading{margin:8px 2px 22px}.jy-calm-ui .page-heading h2{font-size:23px;letter-spacing:-.6px;font-weight:650;margin:0 0 8px}.jy-calm-ui .page-heading p{font-size:13px;color:var(--re-muted);margin:0;line-height:1.6}

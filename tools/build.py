@@ -4,15 +4,15 @@
 用法
 ----
     python tools/build.py                          # 构建全部三个工具
-    python tools/build.py pt-tools rename-unify    # 只构建指定工具
+    python tools/build.py pt-tools rename-project    # 只构建指定工具
     python tools/build.py --date 20260928
     python tools/build.py --out-root D:\\somewhere\\exe
     python tools/build.py --py C:\\path\\to\\python.exe
 
 出口布局（2026-10-14 人类指定）：
     <out-root>/01-ProTools工具箱/pt-tools-T-v<工具版本>/
-    <out-root>/02-剪映工程工具包/jianying-draft-toolkit-T-v<工具版本>/
-    <out-root>/03-统一命名工具/rename-unify-T-v<工具版本>/
+    <out-root>/02-JY Tools/jy-tools-T-v<工具版本>/
+    <out-root>/03-Rename Project/rename-project-T-v<工具版本>/
 exe 与 _internal 同级；版本读各工具 APP_VERSION，日期仅用于构建记录。
 PyInstaller --name 保持 ASCII，完成后 exe 加中文 T版名。
 同版本重建前包完整移入 <out-root>/00-归档/<原目录名>-重建前-<时间戳>/。
@@ -23,7 +23,7 @@ H版由 tools/v4_pack/build_v4.py 构建到工具外层编号01至03，独立仓
 PowerShell 把原生程序的 stderr 当错误流，配 ``$ErrorActionPreference=Stop`` 时，
 PyInstaller 打出第一行 ``INFO:`` 就会触发 NativeCommandError 而**静默中断**
 （表现为只输出 "building ..." 就退出）。四个 build.ps1 里有三份都在跟这个坑搏斗
-（rename-unify 那份还专门写了一段注释解释它，并单独把 ErrorActionPreference
+（rename-project 那份还专门写了一段注释解释它，并单独把 ErrorActionPreference
 降级成 Continue 绕过）。
 
 本脚本一律直调 ``python -m PyInstaller``，逐工具取 returncode，
@@ -64,25 +64,25 @@ TARGETS = [
         "version_file": "src/pt-tools/ptools/core/settings.py",
     },
     {
-        "key": "jianying-draft-toolkit",
-        "entry": "src/jianying-draft-toolkit/code/gui.py",
-        "name": "jianying-draft-toolkit",
+        "key": "jy-tools",
+        "entry": "src/jy-tools/code/gui.py",
+        "name": "jy-tools",
         "args": ["--hidden-import", "tkinterdnd2", "--collect-data", "tkinterdnd2"],
-        "post": "jianying_tools",
-        "cn": "剪映工程工具包-T版",
-        "folder": "02-剪映工程工具包/jianying-draft-toolkit-T",
-        "version_file": "src/jianying-draft-toolkit/code/main.py",
+        "post": "jy_tools",
+        "cn": "JY Tools-T",
+        "folder": "02-JY Tools/jy-tools-T",
+        "version_file": "src/jy-tools/code/main.py",
     },
     {
-        "key": "rename-unify",
-        "entry": "src/rename-unify/code/main.py",
-        "name": "rename-unify",
-        "args": ["--paths", "src/rename-unify/code",
+        "key": "rename-project",
+        "entry": "src/rename-project/code/main.py",
+        "name": "rename-project",
+        "args": ["--paths", "src/rename-project/code",
                  "--hidden-import", "tkinterdnd2", "--collect-data", "tkinterdnd2"],
         "post": None,
-        "cn": "统一命名工具-T版",
-        "folder": "03-统一命名工具/rename-unify-T",
-        "version_file": "src/rename-unify/code/config.py",
+        "cn": "Rename Project-T",
+        "folder": "03-Rename Project/rename-project-T",
+        "version_file": "src/rename-project/code/config.py",
     },
 ]
 
@@ -116,7 +116,7 @@ def tool_version(t):
 
 
 def tool_out_dir(t, out_root, date):
-    """该工具的出口目录：<out-root>/<序号-中文名-T版>-v<tool-version>/。
+    """该工具的出口目录：<out-root>/<序号-显示名>-v<tool-version>/。
 
     每个工具独立一个文件夹，版本读各自源码里的 APP_VERSION（不再共用仓库版本）。
     """
@@ -191,13 +191,13 @@ def post_pt_tools_skills(out_root, t):
     return len(copied) > 0
 
 
-def post_jianying_tools(out_root, t):
+def post_jy_tools(out_root, t):
     """复制 tools/（jy-draftc 解密器）到 exe 同级。
 
     onedir 而非 onefile 的原因就在这里：jy-draftc 运行时要把剪映安装路径
     写进 .env，需要 exe 旁有**真实目录**（onefile 会解到临时目录且被清理）。
     """
-    src = REPO / "src" / "jianying-draft-toolkit" / "tools"
+    src = REPO / "src" / "jy-tools" / "tools"
     dst = Path(out_root) / "tools"
     if dst.is_dir():
         shutil.rmtree(dst, ignore_errors=True)
@@ -209,7 +209,7 @@ def post_jianying_tools(out_root, t):
 
 POST = {
     "pt_tools_skills": post_pt_tools_skills,
-    "jianying_tools": post_jianying_tools,
+    "jy_tools": post_jy_tools,
 }
 
 
@@ -277,7 +277,7 @@ def build_one(py, t, out_root, work_root, spec_dir, staging_root, run_id):
            "--distpath", str(staging_root),
            "--workpath", str(work_root / name),
            "--specpath", str(spec_dir)]
-    # args 里的仓库相对路径（如 --paths src/rename-unify/code）转绝对路径：
+    # args 里的仓库相对路径（如 --paths src/rename-project/code）转绝对路径：
     # PyInstaller 以**当前工作目录**解析这些参数，脚本从别处调用时会找不到
     cmd += [str(REPO / x) if x.startswith("src/") else x for x in t["args"]]
     cmd.append(str(entry))

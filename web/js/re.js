@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════
-   pt-audio-toolkit v4 · re.js（阶段 D：rename-unify 五页签）
+   pt-audio-toolkit v4 · re.js（阶段 D：rename-project 五页签）
    桥存在 → 真功能；无桥（浏览器演示态）→ 视觉可看、动作提示去壳内跑
    壳挂点：__onReLine → __appendLog；__onReEvent ← busy/done/plan/applied/undo/ft_built
    ════════════════════════════════════════════════════════════ */
@@ -727,7 +727,7 @@ let currentAppVersion = "";
 function showAppVersion() {
   if (!currentAppVersion) return;
   document.querySelector('.ver').textContent = 'v' + currentAppVersion;
-  document.title = window.ToolI18n.translate('统一命名工具') + ' v' + currentAppVersion;
+  document.title = window.ToolI18n.translate('Rename Project') + ' v' + currentAppVersion;
 }
 fetch('app-versions.json', {cache:'no-store'}).then(r => {
   if (!r.ok) throw Error('Version manifest unavailable');

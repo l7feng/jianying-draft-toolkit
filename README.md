@@ -1,4 +1,4 @@
-# 剪映工程工具包
+# JY Tools
 
 版本：4.3.1（见 `VERSION`）。
 
@@ -7,11 +7,11 @@
 ## 目录
 
 ```text
-jianying-draft-toolkit/
+jy-tools/
 ├── src/
-│   ├── jianying-draft-toolkit/   主工具：GUI 三个标签页（导出音频／导入多轨／生成交付包）
-│   ├── jianying-mix-ofx/         OFX 混音相关实现与工人进程
-│   ├── jianying-ofx-probe/       OFX 音频探针（含 C 源）
+│   ├── jy-tools/   主工具：GUI 三个标签页（导出音频／导入多轨／生成交付包）
+│   ├── jy-mix-ofx/         OFX 混音相关实现与工人进程
+│   ├── jy-ofx-probe/       OFX 音频探针（含 C 源）
 │   ├── pt-tools/                 与 PT 工具箱共用的扫描／导出代码
 │   └── v4/                       H 版外壳：只留 API 与 shell，界面在库外 Web 真源
 ├── tools/                        打包入口：build.py、v4_pack/build_v4.py、verify_exe.py
@@ -25,7 +25,7 @@ jianying-draft-toolkit/
 主工具 GUI：
 
 ```bash
-python src/jianying-draft-toolkit/code/gui.py
+python src/jy-tools/code/gui.py
 ```
 
 首次运行先按 `packaging/build-requirements.txt` 装依赖；缺组件时用 `packaging/Install-Dependencies.cmd`。界面依赖 Microsoft Edge WebView2 Runtime（大部分 Windows 已安装）。
@@ -39,14 +39,14 @@ python tools/v4_pack/build_v4.py jy   # H 版包
 python tools/verify_exe.py            # 构建后校验
 ```
 
-依赖精确版本见 `packaging/build-requirements.txt`（声明与锁合一，构建前按它装环境）。出口布局与重建前归档规则写在 `tools/build.py` 顶部注释；发行包在 [GitHub Releases](https://github.com/l7feng/jianying-draft-toolkit/releases)，下载 ZIP 完整解压后运行中文名 EXE（保留 `_internal`）。
+依赖精确版本见 `packaging/build-requirements.txt`（声明与锁合一，构建前按它装环境）。出口布局与重建前归档规则写在 `tools/build.py` 顶部注释；发行包在 [GitHub Releases](https://github.com/l7feng/jy-tools/releases)，下载 ZIP 完整解压后运行 JY Tools 的 EXE（保留 `_internal`）。
 
 ## 已知边界
 
 - 面向 Windows 10/11 x64；未在全新 Windows、真实 Pro Tools 工程或真实剪映草稿上做业务验收。
 - 草稿解密依赖剪映自带的 `videoeditor.dll`；剪映版本变化可能导致失效。
 - `src/v4` 的 Web 界面真源仍在本仓之外（`D:/Ai-Files/Tools/Html/pt-audio-toolkit/source`，2026-10-14 人类裁决迁出）。clone 后只能跑 API 与 shell，不能完整复现 H 版界面，属按 07 判据未收口项，待裁决收回或登记例外。
-- 本仓是多工具合仓（PT 工具箱、剪映工具、统一命名共用一套 `web/` 与 `tools/`）；单工具能否独立 clone 运行尚未验证。
+- 本仓是多工具合仓（PT 工具箱、JY Tools、Rename Project 共用一套 `web/` 与 `tools/`）；单工具能否独立 clone 运行尚未验证。
 
 ## 验证
 

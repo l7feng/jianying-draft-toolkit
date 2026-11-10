@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v4 阶段 C · 剪映工程工具包壳入口：pywebview(WebView2) 优先；Edge --app 回退。
+"""v4 阶段 C · JY Tools壳入口：pywebview(WebView2) 优先；Edge --app 回退。
 
 与 shell/desktop_app.py（pt-tools 壳）同构，差异：
 - js_api 桥 = api.jy_api.JyApi（同进程函数直调剪映核心）；
@@ -29,7 +29,7 @@ from api.jy_api import JyApi  # noqa: E402
 PAGE = "jy.html"
 DEFAULT_PORT_JY = 26790
 from shell.app_version import tool_version
-TITLE = "剪映工程工具包 H v" + tool_version("jy")
+TITLE = "JY Tools H v" + tool_version("jy")
 
 
 def run_pywebview(port: int) -> None:
@@ -81,7 +81,7 @@ def main() -> None:
         result={"version":tool_version("jy"),"hello":JyApi().hello(),"ofx":OfxManager().list(),"web":str(WEB_DIR)}
         Path(sys.argv[2]).write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding="utf-8")
         return
-    ap = argparse.ArgumentParser(description="剪映工程工具包 v4 壳入口（阶段 C）")
+    ap = argparse.ArgumentParser(description="JY Tools v4 壳入口（阶段 C）")
     ap.add_argument("--shell", choices=["auto", "pywebview", "edge"], default="auto")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT_JY)
     args = ap.parse_args()

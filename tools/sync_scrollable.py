@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把 `rename-unify/code/scrollable.py` 的 ScrollableFrame 同步到另外两处。
+"""把 `rename-project/code/scrollable.py` 的 ScrollableFrame 同步到另外两处。
 
 三处同源（工具各自独立打包，不引公共包）：
 
-1. `src/rename-unify/code/scrollable.py`（**权威源**，改这个）
+1. `src/rename-project/code/scrollable.py`（**权威源**，改这个）
 2. `src/pt-tools/ptools/gui/scrollable.py`（整文件复制）
-3. `src/jianying-draft-toolkit/code/tabs/base.py::__ScrollableFrame__`（类体替换）
+3. `src/jy-tools/code/tabs/base.py::__ScrollableFrame__`（类体替换）
 
 为什么要有脚本：2026-09-27 实测发现三份已经漂移（base.py 版多了一行
 `tk.Toplevel` 让位判断），人手同步必然会漏。改完跑一次本脚本，
@@ -25,9 +25,9 @@ import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC = ROOT / "src" / "rename-unify" / "code" / "scrollable.py"
+SRC = ROOT / "src" / "rename-project" / "code" / "scrollable.py"
 DST_PT = ROOT / "src" / "pt-tools" / "ptools" / "gui" / "scrollable.py"
-DST_JY = ROOT / "src" / "jianying-draft-toolkit" / "code" / "tabs" / "base.py"
+DST_JY = ROOT / "src" / "jy-tools" / "code" / "tabs" / "base.py"
 
 ANCHOR_START = "class ScrollableFrame(ttk.Frame):"
 ANCHOR_END = "class BaseTab(ttk.Frame):"

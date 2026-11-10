@@ -3,19 +3,19 @@
 
 副本规则（与 scrollable.py / theme.py 相同）：
   ① src/pt-tools/ptools/gui/columns.py         ← 权威源
-  ② src/rename-unify/code/columns.py           ← 整文件复制
-  ③ src/jianying-draft-toolkit/code/columns.py  ← 整文件复制
+  ② src/rename-project/code/columns.py           ← 整文件复制
+  ③ src/jy-tools/code/columns.py  ← 整文件复制
 改一必须同步二三。
 
 为什么需要：Tk 的 Treeview `stretch=True` 只在容器**变宽**时把多余空间分给
 各列；容器**变窄**时列宽不收，整表超出容器 → 父容器被迫出横向滚动条。
-列宽写死总和 1100px > 窗口 minsize 880px 的树（rename-unify 预览表），
+列宽写死总和 1100px > 窗口 minsize 880px 的树（rename-project 预览表），
 窗口一缩就出横条。本模块在容器每次变宽/变窄时按**权重**重新分配可用总宽，
 做到「窗口怎么拖都不出横条」；窄到各列最小宽之和都放不下时，才交给树
 自身的横向滚动条兜底。
 
 用法（树建好后一行挂上，权重缺省按当前列宽比例，保留设计意图）：
-    from ptools.gui.columns import fit_tree_columns   # rename-unify: import columns
+    from ptools.gui.columns import fit_tree_columns   # rename-project: import columns
     fit_tree_columns(self.tree_plan)
 也可显式给权重 / 最小宽：
     fit_tree_columns(tree, weights={"old": 3, "new": 3, "note": 2},

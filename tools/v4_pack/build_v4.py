@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v4 HTML 壳打包（阶段 E）：onedir + web/api/shell 资源内嵌
 
-产物：<out-root>/<01至03-中文工具名>/<英文名-H>-v<仓库VERSION>/<中文名-H版>.exe
+产物：<out-root>/<01至03-显示名>/<英文名-H>-v<仓库VERSION>/<显示名-H>.exe
 用法：python tools/v4_pack/build_v4.py [pt|jy|re|all] [--out-root DIR] [--py PY]
 """
 from __future__ import annotations
@@ -39,18 +39,18 @@ TOOLS = {
     },
     "jy": {
         "entry": "shell.jy_desktop",
-        "name": "jianying-draft-toolkit-v4",
-        "zh": "剪映工程工具包-H版",
-        "folder": "02-剪映工程工具包/jianying-draft-toolkit-H",
+        "name": "jy-tools-v4",
+        "zh": "JY Tools-H",
+        "folder": "02-JY Tools/jy-tools-H",
         # ptools.core.config 为模块级依赖（界面偏好复用 pt C2 层），
         # 2026-09-30 真启动冒烟实锤：缺 --paths src/pt-tools 会运行时 ModuleNotFoundError
         "hidden": ["api.jy_api", "shell.httpd", "ptools.core.config"],
     },
     "re": {
         "entry": "shell.re_desktop",
-        "name": "rename-unify-v4",
-        "zh": "统一命名工具",
-        "folder": "03-统一命名工具/rename-unify",
+        "name": "rename-project-v4",
+        "zh": "Rename Project",
+        "folder": "03-Rename Project/rename-project",
         "hidden": ["api.re_api", "shell.httpd", "ptools.core.config"],
     },
 }
@@ -130,9 +130,9 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
     # 工具核心源码（同进程直调，非 pip 包）；ptools 家族级依赖三个工具都带上
     cmd += ["--paths", str(REPO / "src" / "pt-tools")]
     if key == "jy":
-        cmd += ["--paths", str(REPO / "src" / "jianying-draft-toolkit" / "code")]
+        cmd += ["--paths", str(REPO / "src" / "jy-tools" / "code")]
     if key == "re":
-        cmd += ["--paths", str(REPO / "src" / "rename-unify" / "code")]
+        cmd += ["--paths", str(REPO / "src" / "rename-project" / "code")]
     cmd += ["--collect-all", "webview", "--collect-all", "pythonnet"]
     cmd += ["--collect-all", "aaf2", "--hidden-import", "main", "--hidden-import", "import_audio"]
     cmd += ["--exclude-module", "tkinter", "--exclude-module", "PyQt5",
@@ -171,7 +171,7 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
     else:
         print("[v4-pack] WARN %s: exe not found at %s" % (key, exe))
     # Ship only the reviewed converter files; never copy a machine-local .env.
-    converter = REPO / "src" / "jianying-draft-toolkit" / "tools" / "jy-draftc" / "jy-draftc-amd64-windows"
+    converter = REPO / "src" / "jy-tools" / "tools" / "jy-draftc" / "jy-draftc-amd64-windows"
     destination = final / "tools" / "jy-draftc" / "jy-draftc-amd64-windows"
     destination.mkdir(parents=True, exist_ok=True)
     for filename in ("jy-draftc.exe", "LICENSE", "README.md", "SHA256SUMS.txt", ".env.example"):

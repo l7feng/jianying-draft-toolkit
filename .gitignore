@@ -49,21 +49,21 @@ desktop.ini
 *.log
 
 # ===== 保留：工具依赖的第三方 exe（jy-draftc）=====
-!src/jianying-draft-toolkit/tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe
+!src/jy-tools/tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe
 
 
 # ===== 2026-09-28 配置卫生：个人运行期配置一律不入库 =====
-# src/jianying-draft-toolkit/config.json 曾是运行期 config（含作者机器路径），
+# src/jy-tools/config.json 曾是运行期 config（含作者机器路径），
 # 2026-09-28 从跟踪移除 —— 工具源码模式首次运行会自动生成（见 core/config.py）。
-src/jianying-draft-toolkit/config.json
-src/jianying-draft-toolkit/code/config.json
-src/rename-unify/config.json
+src/jy-tools/config.json
+src/jy-tools/code/config.json
+src/rename-project/config.json
 # v3.14.0 产物归拢：exe 体积大，本地可见但不入库
 release/exe/
 
 # v4 打包工作目录（PyInstaller 中间产物，不入库）
 tools/v4_pack/_build_*/
-src/rename-unify/code/config.json
+src/rename-project/code/config.json
 
 # 分仓准备：不将本机环境或构建中间物纳入发布
 .env

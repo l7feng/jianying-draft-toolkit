@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v4 阶段 D · rename-unify 的 js_api 桥：HTML 前端 ↔ Python 核心（五页签）。
+"""v4 阶段 D · rename-project 的 js_api 桥：HTML 前端 ↔ Python 核心（五页签）。
 
 复用通道（30 号方案 §阶段 D）＝**同进程函数直调**（与 jy_api 同款）：
 - `import core_rules`（规则引擎：identify/make_plan/apply_plan/undo 链，零 tkinter）；
@@ -28,7 +28,7 @@ import threading
 # --- 路径 ---
 V4_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/v4
 SRC_DIR = os.path.dirname(V4_DIR)
-RE_CODE = os.path.join(SRC_DIR, "rename-unify", "code")
+RE_CODE = os.path.join(SRC_DIR, "rename-project", "code")
 PT_ROOT = os.path.join(SRC_DIR, "pt-tools")                             # 家族级界面偏好
 
 for _p in (RE_CODE, PT_ROOT):
@@ -42,7 +42,7 @@ _RE = None
 
 
 def _re() -> dict:
-    """懒加载 rename-unify 核心模块。"""
+    """懒加载 rename-project 核心模块。"""
     global _RE
     with _RE_LOCK:
         if _RE is None:

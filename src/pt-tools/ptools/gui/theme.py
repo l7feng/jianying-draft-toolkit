@@ -3,8 +3,8 @@
 
 副本规则（与 scrollable.py 相同）：
   ① src/pt-tools/ptools/gui/theme.py         ← 权威源
-  ② src/rename-unify/code/theme.py           ← 整文件复制
-  ③ src/jianying-draft-toolkit/code/theme.py  ← 整文件复制
+  ② src/rename-project/code/theme.py           ← 整文件复制
+  ③ src/jy-tools/code/theme.py  ← 整文件复制
 改一必须同步二三。
 
 设计取向（2026-09-28 裁决 D3-甲 + 本轮追加「多色彩主题」）：

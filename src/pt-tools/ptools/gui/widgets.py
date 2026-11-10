@@ -3,8 +3,8 @@
 
 同源三副本（与 theme.py 相同规则）：
   ① src/pt-tools/ptools/gui/widgets.py     ← 权威源
-  ② src/rename-unify/code/widgets.py        ← 整文件复制
-  ③ src/jianying-draft-toolkit/code/widgets.py ← 整文件复制
+  ② src/rename-project/code/widgets.py        ← 整文件复制
+  ③ src/jy-tools/code/widgets.py ← 整文件复制
 
 组件清单：
   · draw_icon()      矢量图标绘制（30+ 图标，24x24 线条风格，主题感知）
@@ -1282,7 +1282,7 @@ class HeroHeader(tk.Frame):
     """现代 App 顶部横幅，制造视觉焦点。
 
     用法：
-        hdr = HeroHeader(parent, title="剪映工程工具包",
+        hdr = HeroHeader(parent, title="JY Tools",
                          subtitle="v2.15.0 · 2026-09-28", icon="music")
         hdr.pack(fill="x")
         # 右侧放状态灯/设置：hdr.right 容器

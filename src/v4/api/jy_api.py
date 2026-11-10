@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v4 阶段 C · 剪映工程工具包的 js_api 桥：HTML 前端 ↔ Python 核心（导入和导出）。
+"""v4 阶段 C · JY Tools的 js_api 桥：HTML 前端 ↔ Python 核心（导入和导出）。
 
 与 pt_api.py 的差异（30 号方案 §阶段 C）：
 - pt-tools 复用 = 子进程 CLI；剪映复用 = **同进程函数直调**（gui.py 同款）：
@@ -30,7 +30,7 @@ from pathlib import Path
 # --- 路径 ---
 V4_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/v4
 SRC_DIR = os.path.dirname(V4_DIR)
-JY_CODE = os.path.join(SRC_DIR, "jianying-draft-toolkit", "code")       # code/（main.py 同层）
+JY_CODE = os.path.join(SRC_DIR, "jy-tools", "code")       # code/（main.py 同层）
 PT_ROOT = os.path.join(SRC_DIR, "pt-tools")                             # 家族级界面偏好复用 pt C2 层
 
 for _p in (JY_CODE, PT_ROOT):
