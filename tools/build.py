@@ -16,7 +16,7 @@
 exe 与 _internal 同级；版本读各工具 APP_VERSION，日期仅用于构建记录。
 PyInstaller --name 保持 ASCII，完成后 exe 加中文 T版名。
 同版本重建前包完整移入 <out-root>/00-归档/<原目录名>-重建前-<时间戳>/。
-H版由 tools/v4_pack/build_v4.py 构建到工具外层编号01至03，独立仓剧本工具外层编号04。
+外壳包由 tools/v4_pack/build_v4.py 构建到工具外层编号01至03，独立仓剧本工具外层编号04。
 
 为什么不用各目录的 build.ps1
 ----------------------------

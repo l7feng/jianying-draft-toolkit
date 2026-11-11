@@ -32,16 +32,16 @@ TOOLS = {
     "pt": {
         "entry": "shell.desktop_app",
         "name": "pt-tools-v4",
-        "zh": "Pro Tools工具箱-H版",
-        "folder": "01-ProTools工具箱/pt-tools-H",
+        "zh": "PT Tools",
+        "folder": "01-PT Tools（Pro Tools 工具箱）/pt-tools",
         "hidden": ["api.pt_api", "shell.httpd", "ptools.core.settings", "ptools.core.config",
                    "ptools.core.i18n", "ptools.core.naming", "ptools.core.scanner"],
     },
     "jy": {
         "entry": "shell.jy_desktop",
         "name": "jy-tools-v4",
-        "zh": "JY Tools-H",
-        "folder": "02-JY Tools/jy-tools-H",
+        "zh": "JY Tools",
+        "folder": "02-JY Tools（剪映工程工具）/jy-tools",
         # ptools.core.config 为模块级依赖（界面偏好复用 pt C2 层），
         # 2026-09-30 真启动冒烟实锤：缺 --paths src/pt-tools 会运行时 ModuleNotFoundError
         "hidden": ["api.jy_api", "shell.httpd", "ptools.core.config"],
@@ -50,7 +50,7 @@ TOOLS = {
         "entry": "shell.re_desktop",
         "name": "rename-project-v4",
         "zh": "Rename Project",
-        "folder": "03-Rename Project/rename-project",
+        "folder": "03-Rename Project（统一命名归位）/rename-project",
         "hidden": ["api.re_api", "shell.httpd", "ptools.core.config"],
     },
 }

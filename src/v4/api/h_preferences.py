@@ -1,4 +1,4 @@
-"""H版独立本机记忆：原子写入，路径/窗口不写入T版或共享配置。"""
+"""本机独立记忆：原子写入，路径/窗口不写入共享配置。"""
 from __future__ import annotations
 import json
 import os

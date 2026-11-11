@@ -13,8 +13,7 @@
    const mark=trim.match(/^([✓✗⚠▶↩▸⬆⬇⏳]+\s*)([\s\S]+)$/);if(mark){const result=english(mark[2]);if(result!==mark[2])translated=mark[1]+result;}
   }
   if(translated===undefined){
-   if(/^H版 v/.test(trim))translated=trim.replace('H版','H');
-   else if(/^（\d+ 条）$/.test(trim))translated=trim.replace(/（(\d+) 条）/,(_,n)=>'('+n+' '+(n==='1'?'entry':'entries')+')');
+   if(/^（\d+ 条）$/.test(trim))translated=trim.replace(/（(\d+) 条）/,(_,n)=>'('+n+' '+(n==='1'?'entry':'entries')+')');
    else if(/^待处理 \d+/.test(trim))translated=trim.replace('待处理','Pending').replace('错/冲突','Errors / conflicts');
    else if(/^计划：\d+ 项/.test(trim))translated=trim.replace('计划：','Plan: ').replace(' 项',' items').replace('待处理','Pending');
    else if(/^已选 \d+ \/ \d+ 轨/.test(trim))translated=trim.replace('已选','Selected').replace(' 轨',' tracks');

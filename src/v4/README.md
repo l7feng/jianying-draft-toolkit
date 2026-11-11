@@ -2,7 +2,7 @@
 
 > 2026-10-14现行Web源：D:/Ai-Files/Tools/Html/pt-audio-toolkit/source。src/v4仅保留API与shell；PT_WEB_ROOT可覆盖开发/打包Web根，冻结包仍使用内嵌web。人类明确选择源码迁出，后文原目录说明按历史保留。
 
-# v4 · H版桌面工具
+# v4 · 桌面工具
 
 当前页面版本 v4.1.1（2026-10-12），三个完整 EXE 入口见仓库 README。共用材质控制检查与隔离启动已通过；以下阶段 A 说明作为历史实现记录保留。
 
