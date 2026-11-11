@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, contextlib, copy, hashlib, json, os, pathlib, shutil, sys, time, traceback, uuid
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 CODE=ROOT/"src/jy-tools/code"
-PREFS=pathlib.Path(r"D:/Ai-Files/Tools/Exe/02-JY Tools/jy-tools-H-v4.3.1/jy.h-preferences.local.json")
+PREFS=pathlib.Path(r"D:/Ai-Files/Tools/Exe/02-JY Tools（剪映工程工具）/jy-tools-v4.3.1/jy.h-preferences.local.json")
 def core():
     if str(CODE) not in sys.path: sys.path.insert(0,str(CODE))
     import main

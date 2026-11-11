@@ -1,4 +1,4 @@
-/* H v4.2.0: 结算台主题、控件参数与本机路径自动记忆。 */
+/* v4.2.0: 结算台主题、控件参数与本机路径自动记忆。 */
 (function(){
   'use strict';
   const tool=location.pathname.endsWith('re.html')?'re':location.pathname.endsWith('jy.html')?'jy':'pt';

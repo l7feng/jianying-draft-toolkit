@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v4 HTML 壳打包（阶段 E）：onedir + web/api/shell 资源内嵌
 
-产物：<out-root>/<01至03-显示名>/<英文名-H>-v<仓库VERSION>/<显示名-H>.exe
+产物：<out-root>/<编号-英文（中文）>/<英文名>-v<仓库VERSION>/<英文显示名>.exe
 用法：python tools/v4_pack/build_v4.py [pt|jy|re|all] [--out-root DIR] [--py PY]
 """
 from __future__ import annotations
@@ -158,7 +158,7 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
     final = tool_out_dir(key, out_root)
     final.parent.mkdir(parents=True, exist_ok=True)
     if final.exists():
-        archive = final.parent.parent / "00-归档"
+        archive = final.parent.parent / "00-Archive（归档）"
         archive.mkdir(parents=True, exist_ok=True)
         previous = archive / (final.name + "-重建前-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
         final.rename(previous)

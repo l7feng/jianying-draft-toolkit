@@ -32,7 +32,7 @@ for _s in (sys.stdout, sys.stderr):
 
 # 出口布局（2026-09-27 人类裁决②，与 tools/build.py 的 TARGETS 同源）：
 #   <root>/pt-tools-v<工具版本>-<日期>/                 ← Pro Tools工具箱.exe
-#   <root>/02-JY Tools/jy-tools-H-v<工具版本>/   ← JY Tools-H.exe
+#   <root>/02-JY Tools（剪映工程工具）/jy-tools-v<工具版本>/   ← JY Tools.exe
 #   <root>/rename-project-v<工具版本>-<日期>/             ← Rename Project.exe
 #   <root>/script-splitter-v.../                       ← 独立仓库自建自检
 #

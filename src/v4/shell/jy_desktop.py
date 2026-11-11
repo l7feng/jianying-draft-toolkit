@@ -29,7 +29,7 @@ from api.jy_api import JyApi  # noqa: E402
 PAGE = "jy.html"
 DEFAULT_PORT_JY = 26790
 from shell.app_version import tool_version
-TITLE = "JY Tools H v" + tool_version("jy")
+TITLE = "JY Tools v" + tool_version("jy")
 
 
 def run_pywebview(port: int) -> None:

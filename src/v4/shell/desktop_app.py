@@ -25,6 +25,7 @@ if V4_DIR not in sys.path:
     sys.path.insert(0, V4_DIR)
 
 from shell.httpd import DEFAULT_PORT, make_server, WEB_DIR  # noqa: E402
+from shell.app_version import tool_version  # noqa: E402
 from api.pt_api import PtApi  # noqa: E402
 
 
@@ -41,7 +42,7 @@ def run_pywebview(port: int) -> None:
     # "Main window failed to start"（2026-09-30 打包冒烟实测），故不在此注入。
     from shell.window_memory import window_options, remember_window
     win = webview.create_window(
-        "Pro Tools 工具箱 H v4.2.1", url, js_api=api,
+        "Pro Tools 工具箱 v" + tool_version("pt"), url, js_api=api,
         **window_options(api._h_preferences))
     remember_window(win, api._h_preferences)
     webview.start(icon=os.path.join(WEB_DIR,'assets','logos','p.ico'))
